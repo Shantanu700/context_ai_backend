@@ -1,4 +1,4 @@
-import uuid
+import uuid6
 
 from django.conf import settings
 from django.db import models
@@ -12,7 +12,8 @@ class Video(models.Model):
         DONE = "done"
         FAILED = "failed"
 
-    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    # public identifier; `id` stays a BigAutoField so FK joins are 8 bytes
+    uuid = models.UUIDField(default=uuid6.uuid7, unique=True, editable=False)
     source_url = models.URLField(blank=True)
     file_key = models.CharField(max_length=512, blank=True)
     status = models.CharField(max_length=16, choices=Status, default=Status.PENDING)
@@ -33,7 +34,7 @@ class Video(models.Model):
         ordering = ["-created_at"]
 
     def __str__(self):
-        return f"{self.file_key or self.source_url or self.id} ({self.status})"
+        return f"{self.file_key or self.source_url or self.uuid} ({self.status})"
 
 
 class Ad(models.Model):

@@ -38,6 +38,6 @@ open http://localhost:8000/admin/
 |---|---|---|
 | GET | `/health` | live |
 | POST | `/videos` | phase 2 |
-| GET | `/videos/{id}/status` | phase 2 |
-| GET | `/videos/{id}/scenes` | phase 3 |
+| GET | `/videos/{uuid}/status` | phase 2 |
+| GET | `/videos/{uuid}/scenes` | phase 3 |
 | GET/POST | `/ads` | phase 2 |

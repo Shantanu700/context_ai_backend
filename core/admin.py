@@ -14,9 +14,9 @@ class SceneInline(admin.TabularInline):
 
 @admin.register(Video)
 class VideoAdmin(admin.ModelAdmin):
-    list_display = ("id", "status", "duration", "progress", "created_at")
+    list_display = ("uuid", "status", "duration", "progress", "created_at")
     list_filter = ("status",)
-    readonly_fields = ("id", "created_at", "updated_at")
+    readonly_fields = ("uuid", "created_at", "updated_at")
     inlines = [SceneInline]
 
     @admin.display(description="progress")
@@ -40,4 +40,5 @@ class SceneAdmin(admin.ModelAdmin):
     list_display = ("video", "index", "start", "end", "tone", "recommended_ad", "brand_safety_flag")
     list_filter = ("brand_safety_flag", "tone")
     search_fields = ("description", "transcript_text")
+    raw_id_fields = ("video", "recommended_ad")
     exclude = ("embedding",)
