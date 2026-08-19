@@ -8,6 +8,7 @@ env = environ.Env(
     DEBUG=(bool, False),
     ALLOWED_HOSTS=(list, ["*"]),
     MAX_VIDEO_SECONDS=(int, 300),
+    STORAGE_BACKEND=(str, "local"),
     EMBEDDING_MODEL=(str, "sentence-transformers/all-MiniLM-L6-v2"),
     EMBEDDING_DIM=(int, 384),
 )
@@ -79,6 +80,47 @@ REST_FRAMEWORK = {
     "DEFAULT_PAGINATION_CLASS": "rest_framework.pagination.PageNumberPagination",
     "PAGE_SIZE": 50,
 }
+
+# --- storage: local filesystem by default, Cloudflare R2 when STORAGE_BACKEND=r2 ---
+STORAGE_BACKEND = env("STORAGE_BACKEND")
+MEDIA_ROOT = env("MEDIA_ROOT", default=str(BASE_DIR / "media"))
+MEDIA_URL = "/media/"
+
+if STORAGE_BACKEND == "r2":
+    _default_storage = {
+        "BACKEND": "storages.backends.s3.S3Storage",
+        "OPTIONS": {
+            "bucket_name": env("R2_BUCKET"),
+            "access_key": env("R2_ACCESS_KEY_ID"),
+            "secret_key": env("R2_SECRET_ACCESS_KEY"),
+            "endpoint_url": env("R2_ENDPOINT_URL"),
+            "region_name": "auto",
+            "default_acl": None,  # R2 has no ACLs
+            "querystring_auth": True,  # keyframe URLs are presigned
+            "querystring_expire": env.int("R2_URL_EXPIRE", default=3600),
+        },
+    }
+else:
+    _default_storage = {"BACKEND": "django.core.files.storage.FileSystemStorage"}
+
+STORAGES = {
+    "default": _default_storage,
+    "staticfiles": {"BACKEND": "django.contrib.staticfiles.storage.StaticFilesStorage"},
+}
+
+# --- celery ---
+REDIS_URL = env("REDIS_URL", default="redis://localhost:6380/0")
+CELERY_BROKER_URL = REDIS_URL
+CELERY_RESULT_BACKEND = REDIS_URL
+CELERY_TASK_TRACK_STARTED = True
+CELERY_BROKER_CONNECTION_RETRY_ON_STARTUP = True
+
+# --- sample video: Meridian, Netflix Open Content, CC BY 4.0 (~850 MB, 4K HDR) ---
+SAMPLE_VIDEO_URL = env(
+    "SAMPLE_VIDEO_URL",
+    default="http://download.opencontent.netflix.com.s3.amazonaws.com/Meridian/Meridian_UHD4k5994_HDR_P3PQ.mp4",
+)
+SAMPLE_DIR = env("SAMPLE_DIR", default=str(BASE_DIR / ".samples"))
 
 # --- pipeline knobs (used from Phase 3 on) ---
 MAX_VIDEO_SECONDS = env("MAX_VIDEO_SECONDS")
