@@ -26,6 +26,7 @@ INSTALLED_APPS = [
     "django.contrib.messages",
     "django.contrib.staticfiles",
     "rest_framework",
+    "drf_spectacular",
     "core",
 ]
 
@@ -79,6 +80,19 @@ REST_FRAMEWORK = {
     "DEFAULT_RENDERER_CLASSES": ["rest_framework.renderers.JSONRenderer"],
     "DEFAULT_PAGINATION_CLASS": "rest_framework.pagination.PageNumberPagination",
     "PAGE_SIZE": 50,
+    "DEFAULT_SCHEMA_CLASS": "drf_spectacular.openapi.AutoSchema",
+}
+
+SPECTACULAR_SETTINGS = {
+    "TITLE": "Context-Aware Ad Recommender",
+    "DESCRIPTION": (
+        "Ingests a video, understands each scene (visuals, speech, tone) and recommends "
+        "which ad to place at which timestamp, with a rationale and a brand-safety flag."
+    ),
+    "VERSION": "0.1.0",
+    "SERVE_INCLUDE_SCHEMA": False,  # the schema endpoint itself is not an API operation
+    "SCHEMA_PATH_PREFIX": "",
+    "ENUM_NAME_OVERRIDES": {"VideoStatusEnum": "core.models.Video.Status"},
 }
 
 # --- storage: local filesystem by default, Cloudflare R2 when STORAGE_BACKEND=r2 ---

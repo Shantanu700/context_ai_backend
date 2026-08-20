@@ -24,6 +24,14 @@ class VideoStatusSerializer(serializers.ModelSerializer):
         return f"{obj.scenes_done}/{obj.scenes_total} scenes analyzed"
 
 
+class VideoJobSerializer(serializers.Serializer):
+    """What POST /videos hands back: the video's public id and the queued Celery job."""
+
+    uuid = serializers.UUIDField(read_only=True)
+    job_id = serializers.CharField(read_only=True)
+    status = serializers.CharField(read_only=True)
+
+
 class VideoCreateSerializer(serializers.Serializer):
     file = serializers.FileField(required=False)
     source_url = serializers.URLField(required=False)

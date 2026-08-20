@@ -55,6 +55,31 @@ uv run manage.py test
 open http://localhost:8000/admin/
 ```
 
+## API documentation
+
+| Path | What |
+|---|---|
+| `/schema` | OpenAPI 3.0.3, YAML. `?format=json` for JSON. Always served. |
+| `/docs` | Swagger UI — **`DEBUG=True` only** |
+| `/redoc` | Redoc — **`DEBUG=True` only** |
+
+The two UIs are HTML, so they are dev-only inspection tools like the admin; the schema
+itself is always available and is what the Next.js client should generate from:
+
+```bash
+curl localhost:8000/schema -o openapi.yaml
+npx openapi-typescript openapi.yaml -o src/api.d.ts
+```
+
+Keep it honest in CI — this fails on any undocumented or mis-documented operation:
+
+```bash
+uv run manage.py spectacular --validate --fail-on-warn --file /dev/null
+```
+
+Swagger UI pulls its assets from a CDN, so `/docs` needs internet. Add
+`drf-spectacular-sidecar` if you want it to work offline.
+
 ## Endpoints
 
 | Method | Path | Status |

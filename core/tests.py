@@ -150,3 +150,45 @@ class FfmpegTests(TestCase):
     def test_keyframe_is_never_upscaled(self):
         out = media.extract_keyframe(self.clip, 1.0, self.tmp / "f.jpg")
         self.assertEqual(media.probe(out)["width"], 320)  # source is narrower than KEYFRAME_WIDTH
+
+
+class SchemaTests(TestCase):
+    """The schema is the contract the Next.js client generates from — keep it honest."""
+
+    def _schema(self):
+        from drf_spectacular.generators import SchemaGenerator
+
+        return SchemaGenerator().get_schema(request=None, public=True)
+
+    def test_every_endpoint_is_documented(self):
+        paths = self._schema()["paths"]
+        self.assertEqual(
+            {(p, verb) for p, ops in paths.items() for verb in ops},
+            {
+                ("/health", "get"),
+                ("/videos", "post"),
+                ("/videos/{uuid}/scenes", "get"),
+                ("/videos/{uuid}/status", "get"),
+                ("/ads", "get"),
+                ("/ads", "post"),
+            },
+        )
+
+    def test_scenes_is_documented_as_a_bare_array(self):
+        op = self._schema()["paths"]["/videos/{uuid}/scenes"]["get"]
+        body = op["responses"]["200"]["content"]["application/json"]["schema"]
+        self.assertEqual(body["type"], "array")  # the view does not paginate
+        self.assertEqual([p["name"] for p in op.get("parameters", [])], ["uuid"])
+
+    def test_upload_documents_both_request_shapes(self):
+        op = self._schema()["paths"]["/videos"]["post"]
+        # DRF's default parsers also accept form-urlencoded; these two are the ones that matter
+        self.assertLessEqual(
+            {"application/json", "multipart/form-data"}, set(op["requestBody"]["content"])
+        )
+        self.assertIn("202", op["responses"])
+
+    def test_schema_endpoint_serves_yaml(self):
+        resp = self.client.get("/schema")
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("openapi", resp.headers["Content-Type"])
