@@ -1,7 +1,7 @@
 [project]
 name = "context-ai-backend"
 version = "0.1.0"
-requires-python = ">=3.12,<3.13"
+requires-python = ">=3.12,<3.14"
 dependencies = [
     "celery[redis]>=5.6.3",
     "django>=6.1",
@@ -17,5 +17,19 @@ dependencies = [
     "psycopg[binary]>=3.3.4",
     "scenedetect>=0.7.1",
     "sentence-transformers>=6.0.0",
+    # declared directly only so [tool.uv.sources] can steer it to the CPU index below;
+    # sentence-transformers pulls it in either way
+    "torch>=2.13.0",
     "uuid6>=2025.0.1",
 ]
+
+# torch's linux wheels default to a CUDA build that drags in ~3.5GB of nvidia-* packages.
+# Nothing here uses a GPU (EMBEDDING_DEVICE=cpu), and uv was uninstalling one of them on
+# every `uv run`. macOS wheels are already CPU-only, hence the marker.
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cpu", marker = "sys_platform == 'linux'" }]

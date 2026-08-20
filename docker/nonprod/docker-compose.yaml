@@ -1,0 +1,43 @@
+
+services:
+  context_ai_django:
+    env_file:
+      - path: ../../.env
+        required: true
+    environment:
+      # .env points at the host ports (5433/6380); inside the network the compose
+      # service names and their real ports are what resolve
+      DATABASE_URL: postgres://postgres:postgres@db:5432/context_ai
+      REDIS_URL: redis://redis:6379/0
+      # linux containers fork fine — the threads pool is only needed on macOS
+      CELERY_WORKER_POOL: prefork
+    build:
+      context: ../..
+      dockerfile: ./docker/nonprod/Dockerfile
+      args:
+        - USER=${USER}
+    volumes:
+      - ../..:/backend
+      - ${HOME}/.ssh:/home/${USER}/.ssh
+      - model_cache:/home/${USER}/.cache
+    ports:
+      - 8022:8000
+    container_name: context_ai_backend_nonprod
+    networks:
+      - backend
+    # a dev box you attach to, not a supervised service:
+    #   docker compose -f docker/nonprod/docker-compose.yaml exec context_ai_django zsh
+    #   uv run manage.py migrate && uv run manage.py runserver 0.0.0.0:8000
+    #   uv run celery -A config worker -l info     (a second shell)
+    command: /bin/sh -c "while sleep 1000; do :; done"
+
+volumes:
+  # whisper + sentence-transformers weights, kept across rebuilds
+  model_cache:
+
+networks:
+  backend:
+    # created by the root docker-compose.yml, which owns postgres and redis.
+    # Start that first: docker compose up -d
+    name: backend_default
+    external: true

@@ -41,6 +41,43 @@ uv run celery -A config worker -l info      # all heavy work happens here
 Ports are 5433/6380 rather than the defaults because 5432/6379 were already in use on the
 development machine. Change `docker-compose.yml` and `DATABASE_URL`/`REDIS_URL` to suit.
 
+## Docker (development)
+
+`docker/nonprod/` builds a dev container you attach to and work inside — it does not
+supervise the app. Postgres and Redis stay in the root `docker-compose.yml`, which also
+owns the network the dev container joins, so bring that up first:
+
+```bash
+docker compose up -d                                            # postgres + redis
+export USER=$USER                                               # the build needs it
+docker compose -f docker/nonprod/docker-compose.yaml up -d --build
+docker compose -f docker/nonprod/docker-compose.yaml exec context_ai_django zsh
+```
+
+Inside the container:
+
+```bash
+uv run manage.py migrate
+uv run manage.py seed_ads
+uv run manage.py runserver 0.0.0.0:8000     # reachable on the host at :8022
+uv run celery -A config worker -l info      # in a second shell
+```
+
+The image is `python:3.13-slim` while local development stays on 3.12 —
+`requires-python` spans both and `uv.lock` covers them. Notes on the setup:
+
+- The repo is bind-mounted at `/backend`, so dependencies install into `/usr/local`
+  rather than `.venv`; a container venv would collide with the host's macOS one.
+- `UV_PYTHON=3.13` overrides the bind-mounted `.python-version` (3.12), which would
+  otherwise make uv fetch a second interpreter inside the container.
+- Model weights live on the `model_cache` volume so whisper and sentence-transformers
+  do not re-download on every rebuild.
+- torch is pinned to the CPU wheel on linux (`[tool.uv.sources]` in `pyproject.toml`).
+  The default CUDA build adds ~1.3GB of nvidia packages that nothing here can use.
+- `CELERY_WORKER_POOL=prefork` — the threads pool is only needed on macOS.
+- `DATABASE_URL`/`REDIS_URL` are overridden to `db:5432`/`redis:6379`; the values in
+  `.env` are host ports and do not resolve inside the network.
+
 ## The sample: Meridian
 
 [Meridian](http://download.opencontent.netflix.com/) is a 12-minute film-noir short that
