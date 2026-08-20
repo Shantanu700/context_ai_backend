@@ -16,8 +16,17 @@ def store(local_path: Path, key: str) -> str:
 
 
 def pull_to_tmp(key: str) -> Path:
-    """Copy a stored object to a local temp file — the pipeline only ever works on local paths."""
-    dest = Path(tempfile.mkdtemp(prefix="ctxai-")) / Path(key).name
+    """Copy a stored object to a local temp file — the pipeline only ever works on local paths.
+
+    Cached by key so the scene-detection and audio tasks don't each re-download the
+    same (possibly 850 MB) file.
+    ponytail: cache is per-host /tmp; with workers on separate machines each host
+    pulls once, which is the intended behaviour anyway.
+    """
+    dest = Path(tempfile.gettempdir()) / "ctxai" / key
+    if dest.exists() and dest.stat().st_size == default_storage.size(key):
+        return dest
+    dest.parent.mkdir(parents=True, exist_ok=True)
     with default_storage.open(key, "rb") as src, dest.open("wb") as out:
         shutil.copyfileobj(src, out)
     return dest

@@ -6,7 +6,7 @@ from rest_framework.decorators import action
 from rest_framework.response import Response
 
 from .models import Ad, Video
-from .serializers import AdSerializer, VideoCreateSerializer, VideoStatusSerializer
+from .serializers import AdSerializer, SceneSerializer, VideoCreateSerializer, VideoStatusSerializer
 from .tasks import process_video
 
 
@@ -42,6 +42,11 @@ class VideoViewSet(viewsets.GenericViewSet):
     @action(detail=True, methods=["get"])
     def status(self, request, uuid=None):
         return Response(VideoStatusSerializer(self.get_object()).data)
+
+    @action(detail=True, methods=["get"])
+    def scenes(self, request, uuid=None):
+        qs = self.get_object().scenes.select_related("recommended_ad")
+        return Response(SceneSerializer(qs, many=True).data)
 
 
 class AdViewSet(mixins.ListModelMixin, mixins.CreateModelMixin, viewsets.GenericViewSet):

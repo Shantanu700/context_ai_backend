@@ -1,6 +1,7 @@
+from django.core.files.storage import default_storage
 from rest_framework import serializers
 
-from .models import Ad, Video
+from .models import Ad, Scene, Video
 
 
 class AdSerializer(serializers.ModelSerializer):
@@ -31,3 +32,19 @@ class VideoCreateSerializer(serializers.Serializer):
         if bool(attrs.get("file")) == bool(attrs.get("source_url")):
             raise serializers.ValidationError("Provide exactly one of `file` or `source_url`.")
         return attrs
+
+
+class SceneSerializer(serializers.ModelSerializer):
+    keyframe_urls = serializers.SerializerMethodField()
+    recommended_ad = AdSerializer(read_only=True)
+
+    class Meta:
+        model = Scene
+        fields = (
+            "index", "start", "end", "keyframe_urls", "transcript_text",
+            "description", "objects_seen", "tone", "iab_categories",
+            "recommended_ad", "match_score", "rationale", "brand_safety_flag",
+        )
+
+    def get_keyframe_urls(self, obj) -> list[str]:
+        return [default_storage.url(key) for key in obj.keyframe_keys]

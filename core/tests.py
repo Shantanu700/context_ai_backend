@@ -1,3 +1,6 @@
+import shutil
+import subprocess
+import unittest
 import tempfile
 from pathlib import Path
 from unittest.mock import patch
@@ -5,6 +8,7 @@ from unittest.mock import patch
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import TestCase, override_settings
 
+from . import media
 from .models import Ad, Scene, Video
 from .storage import pull_to_tmp, store
 
@@ -87,3 +91,62 @@ class ApiTests(TestCase):
         self.assertEqual(resp.status_code, 201)
         self.assertNotIn("embedding", resp.json())
         self.assertEqual(self.client.get("/ads").json()["count"], 1)
+
+
+class MediaTests(TestCase):
+    def test_keyframe_count_scales_with_scene_length(self):
+        self.assertEqual(media.keyframe_times(0, 4), [2.0])  # short scene: one frame, mid-scene
+        self.assertEqual(len(media.keyframe_times(0, 10)), 2)
+        self.assertEqual(len(media.keyframe_times(0, 30)), 3)
+        for start, end in [(0, 4), (0, 10), (12.5, 40)]:
+            for t in media.keyframe_times(start, end):
+                self.assertTrue(start < t < end)  # never land on a cut point
+
+    def test_align_assigns_segments_by_midpoint(self):
+        bounds = [(0.0, 5.0), (5.0, 10.0)]
+        segments = [
+            {"start": 0.5, "end": 2.0, "text": "first"},
+            {"start": 4.5, "end": 5.4, "text": "straddles the cut"},  # midpoint 4.95 -> scene 0
+            {"start": 6.0, "end": 7.0, "text": "second"},
+            {"start": 10.2, "end": 11.0, "text": "overruns the video"},
+        ]
+        self.assertEqual(
+            media.align(bounds, segments),
+            ["first straddles the cut", "second overruns the video"],
+        )
+
+    def test_align_handles_a_silent_video(self):
+        self.assertEqual(media.align([(0.0, 5.0)], []), [""])
+
+
+@unittest.skipIf(shutil.which("ffmpeg") is None, "ffmpeg not installed")
+class FfmpegTests(TestCase):
+    """Pins the ffprobe/ffmpeg contract: a real clip in, parsed metadata and a JPEG out."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.tmp = Path(tempfile.mkdtemp(prefix="ctxai-ffmpeg-tests-"))
+        cls.clip = cls.tmp / "clip.mp4"
+        subprocess.run([
+            "ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc=s=320x240:r=10:d=2",
+            "-pix_fmt", "yuv420p", str(cls.clip),
+        ], check=True)
+
+    def test_probe_reads_metadata_and_no_audio_stream(self):
+        info = media.probe(self.clip)
+        self.assertAlmostEqual(info["duration"], 2.0, places=1)
+        self.assertEqual((info["width"], info["height"]), (320, 240))
+        self.assertFalse(info["has_audio"])
+
+    def test_probe_rejects_a_file_with_no_video(self):
+        audio = self.tmp / "tone.wav"
+        subprocess.run([
+            "ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "sine=f=440:d=1", str(audio),
+        ], check=True)
+        with self.assertRaisesRegex(ValueError, "no video stream"):
+            media.probe(audio)
+
+    def test_keyframe_is_never_upscaled(self):
+        out = media.extract_keyframe(self.clip, 1.0, self.tmp / "f.jpg")
+        self.assertEqual(media.probe(out)["width"], 320)  # source is narrower than KEYFRAME_WIDTH

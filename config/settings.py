@@ -124,5 +124,9 @@ SAMPLE_DIR = env("SAMPLE_DIR", default=str(BASE_DIR / ".samples"))
 
 # --- pipeline knobs (used from Phase 3 on) ---
 MAX_VIDEO_SECONDS = env("MAX_VIDEO_SECONDS")
+WHISPER_MODEL = env("WHISPER_MODEL", default="base")
+# ContentDetector sensitivity: lower cuts more. Worth tuning per source — 4K HDR
+# grades and film grain both shift what counts as a cut.
+SCENE_THRESHOLD = env.float("SCENE_THRESHOLD", default=27.0)
 EMBEDDING_MODEL = env("EMBEDDING_MODEL")
 EMBEDDING_DIM = env("EMBEDDING_DIM")

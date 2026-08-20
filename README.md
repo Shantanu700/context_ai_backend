@@ -62,7 +62,7 @@ open http://localhost:8000/admin/
 | GET | `/health` | live |
 | POST | `/videos` | live — multipart `file` **or** JSON `source_url`, returns `202 {uuid, job_id}` |
 | GET | `/videos/{uuid}/status` | live — `{status, scenes_done/scenes_total, progress}` |
-| GET | `/videos/{uuid}/scenes` | phase 3 |
+| GET | `/videos/{uuid}/scenes` | live — cuts, keyframe URLs, transcript per scene |
 | GET/POST | `/ads` | live |
 
 ```bash
@@ -70,5 +70,29 @@ curl -X POST localhost:8000/videos -F file=@clip.mp4
 curl localhost:8000/videos/<uuid>/status
 ```
 
-The pipeline task is still a stub through Phase 2: it pulls the file back out of storage
-to prove the round-trip, then ticks a fake 5-scene counter. Real media work lands in Phase 3.
+## Pipeline
+
+`process_video` probes the file, then fans out with a Celery chord — scene detection and
+transcription run in parallel, and the callback aligns them and persists the scenes:
+
+```
+process_video          pull to /tmp, ffprobe, reject over MAX_VIDEO_SECONDS
+   |
+   +-- detect_scenes   PySceneDetect ContentDetector -> cuts, then 1-3 keyframes
+   |                   per scene (ffmpeg -ss, downscaled to <=768px) into storage
+   +-- transcribe_audio  mono 16 kHz wav -> faster-whisper segments
+   |                     (skipped, not failed, when there is no audio stream)
+   |
+   v
+build_scenes           align segments to cuts by midpoint, persist Scene rows
+```
+
+Every step runs in a worker — no view ever touches ffmpeg. `WHISPER_MODEL` (default
+`base`) and `SCENE_THRESHOLD` (default 27, lower cuts more) are the knobs worth tuning;
+`tiny` is noticeably faster and noticeably worse. The Gemini analysis and ad matching
+that fill `description`/`tone`/`recommended_ad` land in Phase 4, so those fields come
+back empty for now and `scenes_done` stays at 0.
+
+Videos arriving as `source_url` are downloaded directly; YouTube URLs shell out to
+`yt-dlp` if it is on PATH (`uv add yt-dlp`) and otherwise fail with a message telling
+you to upload a file or use the sample.
