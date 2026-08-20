@@ -7,3 +7,5 @@ media/
 *.sqlite3
 .DS_Store
 .samples/
+frames_preview/
+*.mp4

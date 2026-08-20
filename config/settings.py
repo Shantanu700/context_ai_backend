@@ -147,10 +147,14 @@ GEMINI_API_KEY = env("GEMINI_API_KEY", default="")
 # flash-lite: cheapest of the Flash family and the one with a usable free-tier quota.
 # `gemini-flash-latest` is better at vision but its free tier is 20 requests/day.
 GEMINI_MODEL = env("GEMINI_MODEL", default="gemini-flash-lite-latest")
-# Two Gemini calls per scene (analysis + rationale), so 6/m stays under the free-tier
-# per-minute cap. Raise it on a paid key — this is the main brake on a long video.
-SCENE_ANALYSIS_RATE = env("SCENE_ANALYSIS_RATE", default="6/m")
+# Two Gemini calls per scene, against a free-tier cap of 15 requests/minute. 4/m = 8
+# first-attempt requests, leaving headroom for retries — which spend the same budget,
+# so a tighter rate cascades into 429s. Raise it on a paid key; it is the main brake
+# on a long video.
+SCENE_ANALYSIS_RATE = env("SCENE_ANALYSIS_RATE", default="4/m")
 GEMINI_RETRIES = env.int("GEMINI_RETRIES", default=5)
+# a scene that still 429s after the SDK's own backoff is re-queued this many times
+SCENE_RETRIES = env.int("SCENE_RETRIES", default=3)
 TOP_K_ADS = env.int("TOP_K_ADS", default=3)
 AD_CANDIDATES = env.int("AD_CANDIDATES", default=50)  # pulled by vector distance, then re-ranked
 IAB_BOOST = env.float("IAB_BOOST", default=0.15)  # added per shared IAB category

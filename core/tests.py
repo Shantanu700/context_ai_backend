@@ -322,6 +322,24 @@ class AnalyzeSceneTaskTests(TestCase):
         self.assertIsNone(self.scene.recommended_ad)
         self.assertEqual(self.video.scenes_done, 1)  # but progress advanced
 
+    def test_quota_exhaustion_is_requeued_not_counted(self):
+        rate_limited = RuntimeError("429 RESOURCE_EXHAUSTED")
+        rate_limited.code = 429  # what google.genai APIError carries
+
+        # called directly rather than through a worker, celery's retry() re-raises the
+        # original exception instead of Retry — either way it leaves analyze_scene
+        with self.assertRaises(RuntimeError):
+            self._run(embed_side_effect=lambda texts: (_ for _ in ()).throw(rate_limited))
+
+        self.video.refresh_from_db()
+        self.assertEqual(self.video.scenes_done, 0)  # re-queued, so not counted as done
+
+    def test_a_non_transient_error_is_not_requeued(self):
+        broken = ValueError("malformed response")  # no .code, so nothing to retry for
+        self._run(embed_side_effect=lambda texts: (_ for _ in ()).throw(broken))
+        self.video.refresh_from_db()
+        self.assertEqual(self.video.scenes_done, 1)
+
     def test_status_reports_the_silent_failure(self):
         self._run(embed_side_effect=lambda texts: (_ for _ in ()).throw(RuntimeError("boom")))
         body = self.client.get(f"/videos/{self.video.uuid}/status").json()
@@ -339,3 +357,14 @@ class AdEmbeddingTests(TestCase):
             )
         self.assertEqual(resp.status_code, 201)
         delay.assert_called_once_with(Ad.objects.get().pk)
+
+
+class PreviewFramesTests(TestCase):
+    def test_plain_numbers_are_seconds_not_frame_numbers(self):
+        from core.management.commands.preview_frames import _timecode
+
+        # PySceneDetect reads a bare int as a frame index: "90" meant 1.5s at 59.94fps
+        self.assertEqual(_timecode("90"), 90.0)
+        self.assertIsInstance(_timecode("90"), float)
+        self.assertEqual(_timecode("00:01:30"), "00:01:30")
+        self.assertIsNone(_timecode(None))

@@ -34,11 +34,20 @@ def probe(path: Path) -> dict:
     }
 
 
-def detect_scenes(path: Path) -> list[tuple[float, float]]:
-    """PySceneDetect ContentDetector -> [(start_seconds, end_seconds)]."""
+def detect_scenes(path: Path, threshold=None, start=None, end=None) -> list[tuple[float, float]]:
+    """PySceneDetect ContentDetector -> [(start_seconds, end_seconds)].
+
+    threshold/start/end are for tuning runs (see the preview_frames command); the
+    pipeline calls this with defaults.
+    """
     from scenedetect import ContentDetector, detect
 
-    scenes = detect(str(path), ContentDetector(threshold=settings.SCENE_THRESHOLD))
+    scenes = detect(
+        str(path),
+        ContentDetector(threshold=threshold if threshold is not None else settings.SCENE_THRESHOLD),
+        start_time=start,
+        end_time=end,
+    )
     if not scenes:  # single unbroken shot
         return [(0.0, probe(path)["duration"])]
     return [(s.get_seconds(), e.get_seconds()) for s, e in scenes]

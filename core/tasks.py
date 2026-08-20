@@ -158,12 +158,16 @@ def build_scenes(results: list, video_id: int) -> str:
         raise
 
 
-@shared_task(rate_limit=settings.SCENE_ANALYSIS_RATE)
-def analyze_scene(scene_id: int) -> int:
+TRANSIENT_STATUS = {429, 500, 502, 503, 504}  # rate limit / overloaded, worth re-queuing
+
+
+@shared_task(bind=True, rate_limit=settings.SCENE_ANALYSIS_RATE, max_retries=settings.SCENE_RETRIES)
+def analyze_scene(self, scene_id: int) -> int:
     """Steps 7-9 for one scene: Gemini tags, embedding, ad match, rationale.
 
-    Never raises: a single scene that Gemini chokes on must not strand the chord and
-    leave the whole video stuck in `processing`.
+    Rate-limited quota exhaustion is re-queued a minute later; anything else is logged
+    and the scene left untagged. Either way the chord must not be stranded, so a scene
+    only ever fails quietly — never by raising past the retry budget.
     """
     scene = Scene.objects.get(pk=scene_id)
     try:
@@ -189,11 +193,15 @@ def analyze_scene(scene_id: int) -> int:
             scene.rationale = fit.rationale
             scene.brand_safety_flag = fit.brand_safety_flag
         scene.save()
-    except Exception:
+    except Exception as exc:
+        if getattr(exc, "code", None) in TRANSIENT_STATUS and self.request.retries < self.max_retries:
+            # raises Retry, so the increment below is skipped and the scene is not
+            # double-counted. A minute per attempt: the free-tier window is per minute.
+            raise self.retry(exc=exc, countdown=60 * (self.request.retries + 1))
         logger.exception("scene %s analysis failed", scene_id)
-    finally:
-        # F() because these tasks land concurrently
-        Video.objects.filter(pk=scene.video_id).update(scenes_done=F("scenes_done") + 1)
+
+    # F() because these tasks land concurrently
+    Video.objects.filter(pk=scene.video_id).update(scenes_done=F("scenes_done") + 1)
     return scene_id
 
 
