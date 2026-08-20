@@ -34,9 +34,11 @@ INSTALLED_APPS = [
 
 MIDDLEWARE = [
     "django.middleware.security.SecurityMiddleware",
+    # must precede CommonMiddleware so preflights get their headers even on a redirect
+    "corsheaders.middleware.CorsMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
     "django.middleware.common.CommonMiddleware",
-    "django.middleware.csrf.CsrfViewMiddleware",
+    "config.middleware.DisableCSRFMiddleware",
     "django.contrib.auth.middleware.AuthenticationMiddleware",
     "django.contrib.messages.middleware.MessageMiddleware",
     "django.middleware.clickjacking.XFrameOptionsMiddleware",
@@ -60,6 +62,17 @@ TEMPLATES = [
     },
 ]
 
+# --- CORS: the Next.js client is a separate origin ---
+CORS_ALLOW_ALL_ORIGINS = env.bool("CORS_ALLOW_ALL_ORIGINS", default=True)
+CORS_ALLOWED_ORIGINS = env.list("CORS_ALLOWED_ORIGINS", default=[])
+CORS_ALLOW_CREDENTIALS = True
+CORS_ALLOW_HEADERS = ["ngrok-skip-browser-warning", "content-type", "Authorization"]
+
+# session cookie has to survive a cross-site XHR from the client origin
+SESSION_COOKIE_HTTPONLY = True
+SESSION_COOKIE_SAMESITE = "None"
+SESSION_COOKIE_SECURE = env.bool("SESSION_COOKIE_SECURE", default=True)
+
 DATABASES = {"default": env.db("DATABASE_URL", default="postgres://postgres:postgres@localhost:5433/context_ai")}
 
 AUTH_PASSWORD_VALIDATORS = [
@@ -80,6 +93,9 @@ DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
 REST_FRAMEWORK = {
     "DEFAULT_RENDERER_CLASSES": ["rest_framework.renderers.JSONRenderer"],
+    "DEFAULT_AUTHENTICATION_CLASSES": ["core.permissions.SessionAuthentication"],
+    # authenticated by default; a view opts out with `authentication = False`
+    "DEFAULT_PERMISSION_CLASSES": ["core.permissions.APIAuthenticationPermission"],
     "DEFAULT_PAGINATION_CLASS": "rest_framework.pagination.PageNumberPagination",
     "PAGE_SIZE": 50,
     "DEFAULT_SCHEMA_CLASS": "drf_spectacular.openapi.AutoSchema",

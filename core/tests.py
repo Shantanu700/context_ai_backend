@@ -1,3 +1,4 @@
+import base64
 import shutil
 import subprocess
 import unittest
@@ -5,8 +6,9 @@ import tempfile
 from pathlib import Path
 from unittest.mock import patch
 
+from django.contrib.auth import get_user_model
 from django.core.files.uploadedfile import SimpleUploadedFile
-from django.test import TestCase, override_settings
+from django.test import Client, TestCase, override_settings
 
 from django.conf import settings
 
@@ -52,6 +54,9 @@ class StorageTests(TestCase):
 
 @override_settings(MEDIA_ROOT=MEDIA)
 class ApiTests(TestCase):
+    def setUp(self):
+        self.client.force_login(get_user_model().objects.create_user("tester", password="pw"))
+
     def test_upload_dispatches_pipeline(self):
         upload = SimpleUploadedFile("clip.mp4", b"\x00\x01", content_type="video/mp4")
         with patch("core.views.process_video.delay") as delay:
@@ -169,6 +174,9 @@ class SchemaTests(TestCase):
             {(p, verb) for p, ops in paths.items() for verb in ops},
             {
                 ("/health", "get"),
+                ("/login", "get"),
+                ("/login", "post"),
+                ("/login", "delete"),
                 ("/videos", "post"),
                 ("/videos/{uuid}/scenes", "get"),
                 ("/videos/{uuid}/status", "get"),
@@ -266,6 +274,7 @@ class AnalyzeSceneTaskTests(TestCase):
     """The per-scene task must fill the record, count progress, and never stall the chord."""
 
     def setUp(self):
+        self.client.force_login(get_user_model().objects.create_user("tester", password="pw"))
         self.video = Video.objects.create(scenes_total=1, status=Video.Status.PROCESSING)
         self.scene = Scene.objects.create(video=self.video, index=0, start=0, end=5)
         self.ad = Ad.objects.create(
@@ -348,6 +357,9 @@ class AnalyzeSceneTaskTests(TestCase):
 
 
 class AdEmbeddingTests(TestCase):
+    def setUp(self):
+        self.client.force_login(get_user_model().objects.create_user("tester", password="pw"))
+
     def test_creating_an_ad_over_the_api_queues_its_embedding(self):
         with patch("core.views.embed_ad.delay") as delay:
             resp = self.client.post(
@@ -368,3 +380,83 @@ class PreviewFramesTests(TestCase):
         self.assertIsInstance(_timecode("90"), float)
         self.assertEqual(_timecode("00:01:30"), "00:01:30")
         self.assertIsNone(_timecode(None))
+
+
+class AuthTests(TestCase):
+    """Authenticated by default; only the probe and the login POST are public."""
+
+    def setUp(self):
+        self.user = get_user_model().objects.create_user("tester", password="s3cret")
+        self.video = Video.objects.create()
+
+    def _basic(self, username="tester", password="s3cret"):
+        token = base64.b64encode(f"{username}:{password}".encode()).decode()
+        return f"Basic {token}"
+
+    def test_health_is_public(self):
+        self.assertEqual(self.client.get("/health").status_code, 200)
+
+    def test_protected_endpoints_reject_anonymous_callers(self):
+        for method, path in [
+            ("post", "/videos"),
+            ("get", f"/videos/{self.video.uuid}/status"),
+            ("get", f"/videos/{self.video.uuid}/scenes"),
+            ("get", "/ads"),
+            ("post", "/ads"),
+            ("get", "/login"),
+        ]:
+            with self.subTest(path=path, method=method):
+                resp = getattr(self.client, method)(path)
+                # 401, not 403 — the client needs to know it should log in
+                self.assertEqual(resp.status_code, 401)
+
+    def test_login_returns_a_session_that_unlocks_the_api(self):
+        resp = self.client.post("/login", HTTP_AUTHORIZATION=self._basic())
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["username"], "tester")
+        self.assertEqual(self.client.get("/ads").status_code, 200)
+
+    def test_login_rejects_bad_credentials(self):
+        resp = self.client.post("/login", HTTP_AUTHORIZATION=self._basic(password="wrong"))
+        self.assertEqual(resp.status_code, 401)
+        self.assertEqual(self.client.get("/ads").status_code, 401)
+
+    def test_login_rejects_a_missing_or_malformed_header(self):
+        self.assertEqual(self.client.post("/login").status_code, 401)
+        self.assertEqual(self.client.post("/login", HTTP_AUTHORIZATION="Bearer xyz").status_code, 401)
+
+    def test_logout_drops_the_session(self):
+        self.client.post("/login", HTTP_AUTHORIZATION=self._basic())
+        self.assertEqual(self.client.delete("/login").status_code, 204)
+        self.assertEqual(self.client.get("/ads").status_code, 401)
+
+    def test_csrf_is_not_enforced_on_session_authenticated_writes(self):
+        # DisableCSRFMiddleware: a cross-origin SPA cannot supply a CSRF token
+        client = Client(enforce_csrf_checks=True)
+        client.force_login(self.user)
+        resp = client.post(
+            "/ads",
+            {"brand": "A", "title": "T", "description": "d", "iab_categories": []},
+            content_type="application/json",
+        )
+        self.assertEqual(resp.status_code, 201)
+
+
+class CorsTests(TestCase):
+    ORIGIN = "https://client.example.com"
+
+    def test_preflight_is_answered_for_the_client_origin(self):
+        resp = self.client.options(
+            "/videos",
+            HTTP_ORIGIN=self.ORIGIN,
+            HTTP_ACCESS_CONTROL_REQUEST_METHOD="POST",
+            HTTP_ACCESS_CONTROL_REQUEST_HEADERS="content-type",
+        )
+        self.assertEqual(resp.status_code, 200)
+        # echoed, not "*", because credentials are allowed
+        self.assertEqual(resp.headers["access-control-allow-origin"], self.ORIGIN)
+        self.assertEqual(resp.headers["access-control-allow-credentials"], "true")
+
+    def test_actual_response_carries_the_cors_headers(self):
+        resp = self.client.get("/health", HTTP_ORIGIN=self.ORIGIN)
+        self.assertEqual(resp.headers["access-control-allow-origin"], self.ORIGIN)

@@ -5,6 +5,7 @@ requires-python = ">=3.12,<3.14"
 dependencies = [
     "celery[redis]>=5.6.3",
     "django>=6.1",
+    "django-cors-headers>=4.9.0",
     "django-environ>=0.14.0",
     "django-sslserver-v2>=1.0",
     "django-storages[s3]>=1.14.6",

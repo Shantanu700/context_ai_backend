@@ -123,7 +123,9 @@ and `--end` take seconds or `HH:MM:SS` and let you sample a window of a long fil
 
 | Method | Path | |
 |---|---|---|
-| GET | `/health` | liveness + DB probe |
+| GET | `/health` | liveness + DB probe — **public** |
+| POST | `/login` | `Authorization: Basic base64(user:pass)` -> session cookie — **public** |
+| GET, DELETE | `/login` | who am I / log out |
 | POST | `/videos` | multipart `file` **or** JSON `source_url`; returns `202 {uuid, job_id}` |
 | GET | `/videos/{uuid}/status` | `{status, scenes_done/scenes_total, scenes_failed, progress}` |
 | GET | `/videos/{uuid}/scenes` | scenes with tags, keyframe URLs, recommended ad, rationale, safety flag |
@@ -131,8 +133,16 @@ and `--end` take seconds or `HH:MM:SS` and let you sample a window of a long fil
 | GET | `/schema` | OpenAPI 3.0.3 (YAML; `?format=json` for JSON) |
 | GET | `/docs`, `/redoc` | Swagger UI / Redoc — **`DEBUG=True` only**, they are HTML |
 
+Everything except `/health` and `POST /login` requires a session:
+
 ```bash
-curl -X POST localhost:8000/videos -F file=@clip.mp4
+curl -c jar -X POST localhost:8000/login \
+     -H "Authorization: Basic $(printf 'demo:demopass' | base64)"
+curl -b jar localhost:8000/ads
+```
+
+```bash
+curl -b jar -X POST localhost:8000/videos -F file=@clip.mp4
 curl -X POST localhost:8000/videos -H 'Content-Type: application/json' \
      -d '{"source_url":"https://example.com/clip.mp4"}'
 ```
@@ -149,6 +159,32 @@ CI can hold the docs honest — this fails on any undocumented or mis-documented
 ```bash
 uv run manage.py spectacular --validate --fail-on-warn --file /dev/null
 ```
+
+## Authentication and CORS
+
+Same shape as `certifier_reloaded_backend`: DRF `SessionAuthentication`, a global
+`APIAuthenticationPermission` that makes every endpoint private by default, and views
+opting out with a class attribute:
+
+```python
+class HealthAV(APIView):
+    authentication = False              # whole view is public
+
+class LoginAV(APIView):
+    authentication = {"post": False}    # only POST is public
+```
+
+A new endpoint is therefore authenticated unless it says otherwise — which matters here,
+because `POST /videos` spends Gemini quota.
+
+Log in by POSTing base64 `username:password` in an `Authorization: Basic` header; Django
+sets a session cookie. `DisableCSRFMiddleware` exempts the API from CSRF, which a
+cross-origin client cannot satisfy — safe because the API is JSON-only.
+
+The session cookie is `SameSite=None; Secure` so the client origin can hold it, so
+**over plain-http localhost you need `SESSION_COOKIE_SECURE=False`** or the browser
+silently drops it. CORS defaults to allow-all for development; set
+`CORS_ALLOW_ALL_ORIGINS=False` and `CORS_ALLOWED_ORIGINS` before deploying.
 
 ## Pipeline
 

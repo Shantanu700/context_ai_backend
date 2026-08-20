@@ -1,7 +1,15 @@
 from django.core.files.storage import default_storage
 from rest_framework import serializers
 
+from django.contrib.auth import get_user_model
+
 from .models import Ad, Scene, Video
+
+
+class UserSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = get_user_model()
+        fields = ("id", "username", "email", "is_staff")
 
 
 class AdSerializer(serializers.ModelSerializer):
