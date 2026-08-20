@@ -1,3 +1,4 @@
+import sys
 from pathlib import Path
 
 import environ
@@ -26,6 +27,7 @@ INSTALLED_APPS = [
     "django.contrib.messages",
     "django.contrib.staticfiles",
     "rest_framework",
+    "sslserver",
     "drf_spectacular",
     "core",
 ]
@@ -127,6 +129,10 @@ REDIS_URL = env("REDIS_URL", default="redis://localhost:6380/0")
 CELERY_BROKER_URL = REDIS_URL
 CELERY_RESULT_BACKEND = REDIS_URL
 CELERY_TASK_TRACK_STARTED = True
+# macOS aborts (SIGABRT) when a forked child loads torch — the Objective-C and OpenMP
+# runtimes are not fork-safe. Threads also mean one shared embedding model instead of
+# one copy per worker process. Linux keeps the default prefork pool.
+CELERY_WORKER_POOL = env("CELERY_WORKER_POOL", default="threads" if sys.platform == "darwin" else "prefork")
 CELERY_BROKER_CONNECTION_RETRY_ON_STARTUP = True
 
 # --- sample video: Meridian, Netflix Open Content, CC BY 4.0 (~850 MB, 4K HDR) ---
@@ -136,6 +142,19 @@ SAMPLE_VIDEO_URL = env(
 )
 SAMPLE_DIR = env("SAMPLE_DIR", default=str(BASE_DIR / ".samples"))
 
+# --- gemini + matching ---
+GEMINI_API_KEY = env("GEMINI_API_KEY", default="")
+# flash-lite: cheapest of the Flash family and the one with a usable free-tier quota.
+# `gemini-flash-latest` is better at vision but its free tier is 20 requests/day.
+GEMINI_MODEL = env("GEMINI_MODEL", default="gemini-flash-lite-latest")
+# Two Gemini calls per scene (analysis + rationale), so 6/m stays under the free-tier
+# per-minute cap. Raise it on a paid key — this is the main brake on a long video.
+SCENE_ANALYSIS_RATE = env("SCENE_ANALYSIS_RATE", default="6/m")
+GEMINI_RETRIES = env.int("GEMINI_RETRIES", default=5)
+TOP_K_ADS = env.int("TOP_K_ADS", default=3)
+AD_CANDIDATES = env.int("AD_CANDIDATES", default=50)  # pulled by vector distance, then re-ranked
+IAB_BOOST = env.float("IAB_BOOST", default=0.15)  # added per shared IAB category
+
 # --- pipeline knobs (used from Phase 3 on) ---
 MAX_VIDEO_SECONDS = env("MAX_VIDEO_SECONDS")
 WHISPER_MODEL = env("WHISPER_MODEL", default="base")
@@ -143,4 +162,5 @@ WHISPER_MODEL = env("WHISPER_MODEL", default="base")
 # grades and film grain both shift what counts as a cut.
 SCENE_THRESHOLD = env.float("SCENE_THRESHOLD", default=27.0)
 EMBEDDING_MODEL = env("EMBEDDING_MODEL")
+EMBEDDING_DEVICE = env("EMBEDDING_DEVICE", default="cpu")
 EMBEDDING_DIM = env("EMBEDDING_DIM")

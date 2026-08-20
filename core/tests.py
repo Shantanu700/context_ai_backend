@@ -8,7 +8,10 @@ from unittest.mock import patch
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import TestCase, override_settings
 
+from django.conf import settings
+
 from . import media
+from .matching import ad_text, rank_ads, scene_text
 from .models import Ad, Scene, Video
 from .storage import pull_to_tmp, store
 
@@ -192,3 +195,147 @@ class SchemaTests(TestCase):
         resp = self.client.get("/schema")
         self.assertEqual(resp.status_code, 200)
         self.assertIn("openapi", resp.headers["Content-Type"])
+
+
+def vec(*head) -> list[float]:
+    """A unit-ish EMBEDDING_DIM vector whose leading components we control."""
+    return list(head) + [0.0] * (settings.EMBEDDING_DIM - len(head))
+
+
+class MatchingTests(TestCase):
+    def setUp(self):
+        self.video = Video.objects.create()
+        self.scene = Scene.objects.create(
+            video=self.video, index=0, start=0, end=5,
+            description="a family drives along the coast",
+            tone="warm", iab_categories=["Automotive", "Travel"],
+            embedding=vec(1.0, 0.0),
+        )
+
+    def test_shared_iab_category_outranks_a_closer_vector(self):
+        closer = Ad.objects.create(
+            brand="Closer", title="Exact vector match", description="x",
+            iab_categories=["Pets"], embedding=vec(1.0, 0.0),
+        )
+        # cosine similarity 0.9, so it trails by 0.1 — less than one IAB_BOOST of 0.15
+        boosted = Ad.objects.create(
+            brand="Boosted", title="Shares two categories", description="x",
+            iab_categories=["Automotive", "Travel"], embedding=vec(0.9, 0.43588989),
+        )
+
+        ranked = rank_ads(self.scene)
+        self.assertEqual(ranked[0][0].pk, boosted.pk)
+        self.assertEqual(ranked[1][0].pk, closer.pk)
+        self.assertAlmostEqual(ranked[1][1], 1.0, places=4)  # sim 1.0, no shared category
+        self.assertGreater(ranked[0][1], ranked[1][1])
+
+    def test_iab_match_is_case_insensitive(self):
+        Ad.objects.create(
+            brand="A", title="lowercased categories", description="x",
+            iab_categories=["automotive"], embedding=vec(1.0, 0.0),
+        )
+        self.assertAlmostEqual(rank_ads(self.scene)[0][1], 1.0 + settings.IAB_BOOST, places=4)
+
+    def test_ads_without_an_embedding_are_never_matched(self):
+        Ad.objects.create(brand="Unembedded", title="no vector", description="x")
+        self.assertEqual(rank_ads(self.scene), [])
+
+    def test_ranking_is_capped_at_top_k(self):
+        for i in range(settings.TOP_K_ADS + 3):
+            Ad.objects.create(brand=f"B{i}", title=f"T{i}", description="x", embedding=vec(1.0, i / 100))
+        self.assertEqual(len(rank_ads(self.scene)), settings.TOP_K_ADS)
+
+    def test_embedded_text_carries_visuals_tone_and_speech(self):
+        self.scene.objects_seen = ["car", "coastline"]
+        self.scene.transcript_text = "we should pull over here"
+        text = scene_text(self.scene)
+        for fragment in ["family drives", "car, coastline", "warm", "Automotive", "pull over"]:
+            self.assertIn(fragment, text)
+
+    def test_ad_text_includes_brand_tone_and_categories(self):
+        ad = Ad.objects.create(
+            brand="Northwind", title="Vega EV", description="An electric crossover.",
+            iab_categories=["Automotive"], target_tone="aspirational",
+        )
+        self.assertIn("Northwind", ad_text(ad))
+        self.assertIn("aspirational", ad_text(ad))
+        self.assertIn("Automotive", ad_text(ad))
+
+
+class AnalyzeSceneTaskTests(TestCase):
+    """The per-scene task must fill the record, count progress, and never stall the chord."""
+
+    def setUp(self):
+        self.video = Video.objects.create(scenes_total=1, status=Video.Status.PROCESSING)
+        self.scene = Scene.objects.create(video=self.video, index=0, start=0, end=5)
+        self.ad = Ad.objects.create(
+            brand="Kettle & Co", title="Coffee", description="beans",
+            iab_categories=["Food & Drink"], target_tone="warm", embedding=vec(1.0),
+        )
+
+    def _run(self, analysis=None, fit=None, embed_side_effect=None):
+        from types import SimpleNamespace
+
+        from . import tasks
+
+        analysis = analysis or SimpleNamespace(
+            description="two friends share coffee", objects=["mug"], tone="warm",
+            iab_categories=["Food & Drink"],
+        )
+        fit = fit or SimpleNamespace(rationale="the ad matches the cosy mood", brand_safety_flag=False)
+        with (
+            patch.object(tasks.gemini, "analyze_scene", return_value=analysis) as ana,
+            patch.object(tasks.gemini, "write_rationale", return_value=fit),
+            patch.object(tasks, "embed", side_effect=embed_side_effect or (lambda texts: [vec(1.0)])),
+        ):
+            tasks.analyze_scene(self.scene.pk)
+        return ana
+
+    def test_fills_tags_recommendation_and_progress(self):
+        self._run()
+        self.scene.refresh_from_db()
+        self.video.refresh_from_db()
+
+        self.assertEqual(self.scene.description, "two friends share coffee")
+        self.assertEqual(self.scene.tone, "warm")
+        self.assertEqual(self.scene.iab_categories, ["Food & Drink"])
+        self.assertEqual(self.scene.objects_seen, ["mug"])
+        self.assertEqual(self.scene.recommended_ad, self.ad)
+        self.assertEqual(self.scene.rationale, "the ad matches the cosy mood")
+        self.assertFalse(self.scene.brand_safety_flag)
+        self.assertEqual(self.scene.top_matches, [{"ad_id": self.ad.pk, "score": 1.15}])
+        self.assertEqual(self.video.scenes_done, 1)
+
+    def test_persists_a_raised_brand_safety_flag(self):
+        from types import SimpleNamespace
+
+        self._run(fit=SimpleNamespace(rationale="upbeat ad against a grim scene", brand_safety_flag=True))
+        self.scene.refresh_from_db()
+        self.assertTrue(self.scene.brand_safety_flag)
+
+    def test_a_failing_scene_still_counts_so_the_chord_completes(self):
+        self._run(embed_side_effect=lambda texts: (_ for _ in ()).throw(RuntimeError("gemini exploded")))
+        self.scene.refresh_from_db()
+        self.video.refresh_from_db()
+
+        self.assertEqual(self.scene.description, "")  # nothing persisted
+        self.assertIsNone(self.scene.recommended_ad)
+        self.assertEqual(self.video.scenes_done, 1)  # but progress advanced
+
+    def test_status_reports_the_silent_failure(self):
+        self._run(embed_side_effect=lambda texts: (_ for _ in ()).throw(RuntimeError("boom")))
+        body = self.client.get(f"/videos/{self.video.uuid}/status").json()
+        self.assertEqual(body["scenes_done"], 1)
+        self.assertEqual(body["scenes_failed"], 1)
+
+
+class AdEmbeddingTests(TestCase):
+    def test_creating_an_ad_over_the_api_queues_its_embedding(self):
+        with patch("core.views.embed_ad.delay") as delay:
+            resp = self.client.post(
+                "/ads",
+                {"brand": "A", "title": "T", "description": "d", "iab_categories": ["Pets"]},
+                content_type="application/json",
+            )
+        self.assertEqual(resp.status_code, 201)
+        delay.assert_called_once_with(Ad.objects.get().pk)

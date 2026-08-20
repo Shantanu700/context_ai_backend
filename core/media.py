@@ -2,6 +2,7 @@
 
 import json
 import subprocess
+import threading
 import wave
 from pathlib import Path
 
@@ -10,6 +11,7 @@ from django.conf import settings
 
 KEYFRAME_WIDTH = 768
 _whisper = None
+_whisper_lock = threading.Lock()  # worker uses a thread pool; load the model exactly once
 
 
 def _run(cmd: list[str]) -> str:
@@ -70,10 +72,11 @@ def extract_audio(path: Path, dest: Path) -> Path:
 def transcribe(wav: Path) -> list[dict]:
     """faster-whisper with segment timestamps."""
     global _whisper
-    if _whisper is None:
-        from faster_whisper import WhisperModel
+    with _whisper_lock:
+        if _whisper is None:
+            from faster_whisper import WhisperModel
 
-        _whisper = WhisperModel(settings.WHISPER_MODEL, device="cpu", compute_type="int8")
+            _whisper = WhisperModel(settings.WHISPER_MODEL, device="cpu", compute_type="int8")
 
     # hand whisper the samples directly: ffmpeg already produced 16 kHz mono pcm_s16le,
     # so this skips a second decode (and pyav, whose bundled dylibs clash with cv2's)

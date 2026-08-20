@@ -13,7 +13,7 @@ from .serializers import (
     VideoJobSerializer,
     VideoStatusSerializer,
 )
-from .tasks import process_video
+from .tasks import embed_ad, process_video
 
 _health_schema = inline_serializer(
     name="Health",
@@ -101,3 +101,7 @@ class AdViewSet(mixins.ListModelMixin, mixins.CreateModelMixin, viewsets.Generic
 
     queryset = Ad.objects.all()
     serializer_class = AdSerializer
+
+    def perform_create(self, serializer):
+        ad = serializer.save()
+        embed_ad.delay(ad.pk)  # embedding in a worker: the model is 90 MB

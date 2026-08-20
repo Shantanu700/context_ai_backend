@@ -87,7 +87,7 @@ Swagger UI pulls its assets from a CDN, so `/docs` needs internet. Add
 | GET | `/health` | live |
 | POST | `/videos` | live — multipart `file` **or** JSON `source_url`, returns `202 {uuid, job_id}` |
 | GET | `/videos/{uuid}/status` | live — `{status, scenes_done/scenes_total, progress}` |
-| GET | `/videos/{uuid}/scenes` | live — cuts, keyframe URLs, transcript per scene |
+| GET | `/videos/{uuid}/scenes` | live — tags, keyframes, transcript, recommended ad + rationale + safety flag |
 | GET/POST | `/ads` | live |
 
 ```bash
@@ -110,13 +110,51 @@ process_video          pull to /tmp, ffprobe, reject over MAX_VIDEO_SECONDS
    |
    v
 build_scenes           align segments to cuts by midpoint, persist Scene rows
+   |
+   +-- group of analyze_scene, one per scene (rate-limited)
+   |     7. keyframes + transcript -> Gemini -> {description, objects, tone, iab_categories}
+   |     8. scene embedding -> pgvector cosine vs the ad catalog, + IAB_BOOST per shared category
+   |     9. top match -> Gemini one-line rationale + brand_safety_flag
+   |
+   v
+finish_video           chord callback marks the video done
 ```
 
-Every step runs in a worker — no view ever touches ffmpeg. `WHISPER_MODEL` (default
-`base`) and `SCENE_THRESHOLD` (default 27, lower cuts more) are the knobs worth tuning;
-`tiny` is noticeably faster and noticeably worse. The Gemini analysis and ad matching
-that fill `description`/`tone`/`recommended_ad` land in Phase 4, so those fields come
-back empty for now and `scenes_done` stays at 0.
+Every step runs in a worker — no view ever touches ffmpeg or Gemini. `scenes_done`
+counts *attempts*: a scene Gemini chokes on is logged and skipped rather than stalling
+the chord, and `scenes_failed` on the status endpoint reports how many ended untagged.
+
+Knobs worth tuning: `WHISPER_MODEL` (default `base`; `tiny` is much faster and much
+worse), `SCENE_THRESHOLD` (default 27, lower cuts more), `IAB_BOOST` (default 0.15 per
+shared category) and `SCENE_ANALYSIS_RATE`.
+
+## Ad catalog
+
+```bash
+uv run manage.py seed_ads --replace     # 12 ads, embedded locally
+```
+
+Ads created through `POST /ads` get embedded by a worker task; an ad with no embedding is
+never matched. Gemini is restricted to a fixed IAB vocabulary (`core/gemini.py`) — with
+free-form categories, scene and ad categories would never overlap and the boost would
+be dead weight.
+
+## Gemini quota
+
+Default model is `gemini-flash-lite-latest`: cheapest of the Flash family and the one
+with a workable free tier. `gemini-flash-latest` currently resolves to
+`gemini-3.7-flash`, whose free tier is **20 requests per day** — at two calls per scene
+that is ten scenes before it starts 429ing. `SCENE_ANALYSIS_RATE` (default `6/m`) keeps
+the per-minute cap happy; raise it on a paid key.
+
+## Running on macOS
+
+Two platform quirks, both handled in settings, both worth knowing:
+
+- The Celery worker uses the **threads** pool on Darwin. A forked child that loads torch
+  aborts, because the Objective-C and OpenMP runtimes are not fork-safe.
+- `EMBEDDING_DEVICE` defaults to **cpu**. sentence-transformers otherwise selects MPS,
+  and torch's Metal kernels segfault when several worker threads drive them.
 
 Videos arriving as `source_url` are downloaded directly; YouTube URLs shell out to
 `yt-dlp` if it is on PATH (`uv add yt-dlp`) and otherwise fail with a message telling

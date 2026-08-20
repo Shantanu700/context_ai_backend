@@ -12,16 +12,22 @@ class AdSerializer(serializers.ModelSerializer):
 
 class VideoStatusSerializer(serializers.ModelSerializer):
     progress = serializers.SerializerMethodField()
+    scenes_failed = serializers.SerializerMethodField()
 
     class Meta:
         model = Video
         fields = (
             "uuid", "status", "error", "duration", "width", "height", "has_audio",
-            "scenes_total", "scenes_done", "progress", "created_at", "updated_at",
+            "scenes_total", "scenes_done", "scenes_failed", "progress", "created_at", "updated_at",
         )
 
     def get_progress(self, obj) -> str:
         return f"{obj.scenes_done}/{obj.scenes_total} scenes analyzed"
+
+    def get_scenes_failed(self, obj) -> int:
+        """scenes_done counts attempts, so compare it against what actually got tagged —
+        counting untagged scenes alone would report every pending scene as a failure."""
+        return max(obj.scenes_done - obj.scenes.exclude(description="").count(), 0)
 
 
 class VideoJobSerializer(serializers.Serializer):

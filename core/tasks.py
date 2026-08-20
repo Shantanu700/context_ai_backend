@@ -1,14 +1,21 @@
+import logging
 import shutil
 import subprocess
 import tempfile
 from pathlib import Path
 
-from celery import chord, shared_task
+from celery import chord, group, shared_task
 from django.conf import settings
+from django.core.files.storage import default_storage
+from django.db.models import F
 
-from . import media
-from .models import Scene, Video
+from . import gemini, media
+from .embeddings import embed
+from .matching import ad_text, rank_ads, scene_text
+from .models import Ad, Scene, Video
 from .storage import download, pull_to_tmp, store
+
+logger = logging.getLogger(__name__)
 
 
 def _fail(video_id: int, exc: Exception) -> None:
@@ -132,10 +139,85 @@ def build_scenes(results: list, video_id: int) -> str:
             )
             for i, (s, text) in enumerate(zip(scenes, texts))
         ])
-        Video.objects.filter(pk=video_id).update(
-            scenes_total=len(scenes), scenes_done=0, status=Video.Status.DONE
+        Video.objects.filter(pk=video_id).update(scenes_total=len(scenes), scenes_done=0)
+
+        scene_ids = list(
+            Scene.objects.filter(video_id=video_id).order_by("index").values_list("pk", flat=True)
         )
+        if scene_ids:
+            # the errback belongs on the chord body; celery rejects links on a group header
+            chord(
+                group(analyze_scene.s(pk) for pk in scene_ids),
+                finish_video.s(video_id).on_error(fail_video.s(video_id=video_id)),
+            ).apply_async()
+        else:
+            Video.objects.filter(pk=video_id).update(status=Video.Status.DONE)
         return f"built {len(scenes)} scenes, {len(segments)} transcript segments"
     except Exception as exc:
         _fail(video_id, exc)
         raise
+
+
+@shared_task(rate_limit=settings.SCENE_ANALYSIS_RATE)
+def analyze_scene(scene_id: int) -> int:
+    """Steps 7-9 for one scene: Gemini tags, embedding, ad match, rationale.
+
+    Never raises: a single scene that Gemini chokes on must not strand the chord and
+    leave the whole video stuck in `processing`.
+    """
+    scene = Scene.objects.get(pk=scene_id)
+    try:
+        frames = []
+        for key in scene.keyframe_keys:
+            with default_storage.open(key, "rb") as f:
+                frames.append(f.read())
+
+        analysis = gemini.analyze_scene(frames, scene.transcript_text)
+        scene.description = analysis.description
+        scene.objects_seen = analysis.objects
+        scene.tone = analysis.tone
+        scene.iab_categories = analysis.iab_categories
+        scene.embedding = embed([scene_text(scene)])[0]
+
+        matches = rank_ads(scene)
+        scene.top_matches = [{"ad_id": ad.pk, "score": round(score, 4)} for ad, score in matches]
+        if matches:
+            best, score = matches[0]
+            fit = gemini.write_rationale(scene, best)
+            scene.recommended_ad = best
+            scene.match_score = score
+            scene.rationale = fit.rationale
+            scene.brand_safety_flag = fit.brand_safety_flag
+        scene.save()
+    except Exception:
+        logger.exception("scene %s analysis failed", scene_id)
+    finally:
+        # F() because these tasks land concurrently
+        Video.objects.filter(pk=scene.video_id).update(scenes_done=F("scenes_done") + 1)
+    return scene_id
+
+
+@shared_task
+def finish_video(scene_ids: list, video_id: int) -> str:
+    Video.objects.filter(pk=video_id).update(status=Video.Status.DONE)
+    return f"analyzed {len(scene_ids)} scenes"
+
+
+@shared_task
+def fail_video(*args, video_id: int | None = None) -> None:
+    """Chord errback. analyze_scene swallows its own errors, so reaching this means the
+    worker itself died (OOM, kill, segfault) — without it the video sits in `processing`.
+
+    *args because celery passes errbacks a different shape depending on how they are
+    attached; video_id comes through as a kwarg so it can never be positionally confused.
+    """
+    _fail(video_id, Exception(f"scene analysis did not complete: {args[-1] if args else 'worker lost'}"))
+
+
+@shared_task
+def embed_ad(ad_id: int) -> int:
+    """Ads created through the API need an embedding too, or they can never be matched."""
+    ad = Ad.objects.get(pk=ad_id)
+    ad.embedding = embed([ad_text(ad)])[0]
+    ad.save(update_fields=["embedding"])
+    return ad_id
