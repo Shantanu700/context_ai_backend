@@ -25,7 +25,7 @@ POST /videos ──► Celery ──► ffprobe ─► scene detection ─► ke
 ```bash
 uv sync
 cp .env.example .env          # then put your GEMINI_API_KEY in it
-docker compose up -d          # postgres :5433, redis :6380
+docker compose up -d          # postgres :5433, redis :6380 (redis is always needed)
 uv run manage.py migrate
 uv run manage.py seed_ads     # 12 ads, embedded locally
 uv run manage.py createsuperuser   # optional, for /admin
@@ -77,6 +77,29 @@ The image is `python:3.13-slim` while local development stays on 3.12 —
 - `CELERY_WORKER_POOL=prefork` — the threads pool is only needed on macOS.
 - `DATABASE_URL`/`REDIS_URL` are overridden to `db:5432`/`redis:6379`; the values in
   `.env` are host ports and do not resolve inside the network.
+
+## Database
+
+`DATABASE_URL` picks the database; nothing else changes. Production points at Supabase
+(session pooler, port 5432) — pgvector ships enabled there, in the `public` schema, so
+the initial migration applies as-is.
+
+The transaction pooler (port 6543) also works: settings detect it and disable prepared
+statements and server-side cursors, which a multiplexing pooler cannot support.
+`CONN_MAX_AGE=60` keeps connections alive, since a managed database is a TLS round-trip
+away rather than on localhost.
+
+**`manage.py test` always uses a local database**, never `DATABASE_URL`. The test runner
+CREATEs and DROPs an entire database, which should not happen on managed infrastructure —
+and behind a pooler the DROP fails outright, because the pooler keeps a session open and
+Postgres refuses with *"database is being accessed by other users"*. Override with
+`TEST_DATABASE_URL` if you need somewhere else.
+
+The bundled Postgres container still exists for anyone who wants it:
+
+```bash
+docker compose -f docker/prod/docker-compose.yaml --env-file .env.prod --profile localdb up -d
+```
 
 ## Production
 

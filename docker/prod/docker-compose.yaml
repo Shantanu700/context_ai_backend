@@ -10,7 +10,8 @@ x-app: &app
     - path: ../../.env.prod
       required: true
   environment:
-    DATABASE_URL: postgres://postgres:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD, and pass --env-file .env.prod}@db:5432/context_ai
+    # DATABASE_URL comes from .env.prod: point it at Supabase (or any managed postgres),
+    # or at the bundled db service below by starting the `localdb` profile
     REDIS_URL: redis://redis:6379/0
     DEBUG: "False"
   volumes:
@@ -19,8 +20,6 @@ x-app: &app
     # harmless) when STORAGE_BACKEND=r2, which is what a multi-host deploy needs.
     - media:/app/media
   depends_on:
-    db:
-      condition: service_healthy
     redis:
       condition: service_started
   restart: unless-stopped
@@ -43,11 +42,14 @@ services:
       timeout: 10s
       retries: 3
 
+  # Only started with `--profile localdb`. Managed postgres (Supabase) is the default;
+  # if you use this instead, set DATABASE_URL to postgres://postgres:...@db:5432/context_ai
   db:
     image: pgvector/pgvector:pg16
+    profiles: ["localdb"]
     environment:
       POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD, and pass --env-file .env.prod}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
       POSTGRES_DB: context_ai
     volumes:
       - pgdata:/var/lib/postgresql/data

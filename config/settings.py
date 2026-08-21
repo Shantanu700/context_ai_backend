@@ -85,7 +85,26 @@ SESSION_COOKIE_HTTPONLY = True
 SESSION_COOKIE_SAMESITE = "None"
 SESSION_COOKIE_SECURE = env.bool("SESSION_COOKIE_SECURE", default=True)
 
-DATABASES = {"default": env.db("DATABASE_URL", default="postgres://postgres:postgres@localhost:5433/context_ai")}
+_LOCAL_DB = "postgres://postgres:postgres@localhost:5433/context_ai"
+DATABASES = {"default": env.db("DATABASE_URL", default=_LOCAL_DB)}
+
+# `manage.py test` CREATEs and DROPs a whole database, which has no business happening on
+# managed infrastructure — and against a connection pooler the DROP fails anyway, because
+# the pooler keeps a session open ("database is being accessed by other users").
+if "test" in sys.argv:
+    DATABASES = {"default": env.db("TEST_DATABASE_URL", default=_LOCAL_DB)}
+
+# A managed database (Supabase et al) is a TLS round-trip away, so reopening a connection
+# per request costs far more than it does against localhost.
+DATABASES["default"]["CONN_MAX_AGE"] = env.int("CONN_MAX_AGE", default=60)
+DATABASES["default"]["CONN_HEALTH_CHECKS"] = True
+
+# Supabase's transaction pooler (port 6543) multiplexes connections, so server-side
+# prepared statements and cursors leak across sessions and error out. Its session pooler
+# (5432) has no such problem — this only kicks in for the transaction one.
+if ":6543/" in env("DATABASE_URL", default=""):
+    DATABASES["default"].setdefault("OPTIONS", {})["prepare_threshold"] = None
+    DATABASES["default"]["DISABLE_SERVER_SIDE_CURSORS"] = True
 
 AUTH_PASSWORD_VALIDATORS = [
     {"NAME": "django.contrib.auth.password_validation.UserAttributeSimilarityValidator"},
