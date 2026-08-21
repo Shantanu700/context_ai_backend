@@ -103,6 +103,9 @@ docker compose -f docker/prod/docker-compose.yaml --env-file .env.prod --profile
 
 ## Production
 
+Deploying to a host: see **[DEPLOY.md](DEPLOY.md)** for Oracle Cloud Always Free, which
+runs web, worker and Redis on one free ARM VM alongside Supabase and R2.
+
 ```bash
 cp .env.prod.example .env.prod        # fill in SECRET_KEY, POSTGRES_PASSWORD, GEMINI_API_KEY, R2_*
 docker compose -f docker/prod/docker-compose.yaml --env-file .env.prod up -d --build
