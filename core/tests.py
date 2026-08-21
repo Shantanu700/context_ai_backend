@@ -1,6 +1,8 @@
 import base64
+import os
 import shutil
 import subprocess
+import time
 import unittest
 import tempfile
 from pathlib import Path
@@ -15,7 +17,8 @@ from django.conf import settings
 from . import media
 from .matching import ad_text, rank_ads, scene_text
 from .models import Ad, Scene, Video
-from .storage import pull_to_tmp, store
+from . import storage
+from .storage import pull_to_tmp, purge_tmp, store, sweep_tmp
 
 MEDIA = tempfile.mkdtemp(prefix="ctxai-tests-")
 
@@ -45,11 +48,48 @@ class SmokeTests(TestCase):
 
 @override_settings(MEDIA_ROOT=MEDIA)
 class StorageTests(TestCase):
+    def setUp(self):
+        # isolate the cache root: the real /tmp/ctxai holds pulls from actual pipeline
+        # runs, and a sweep test would count those too
+        patcher = patch.object(storage, "TMP_ROOT", Path(tempfile.mkdtemp(prefix="ctxai-tests-")))
+        self.tmp_root = patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addCleanup(shutil.rmtree, self.tmp_root, True)
+
     def test_store_then_pull_round_trips(self):
         src = Path(MEDIA) / "src.bin"
         src.write_bytes(b"video-bytes")
         key = store(src, "videos/test/src.bin")
         self.assertEqual(pull_to_tmp(key).read_bytes(), b"video-bytes")
+
+    def test_purge_removes_the_cached_pull_and_its_directory(self):
+        src = Path(MEDIA) / "purge.bin"
+        src.write_bytes(b"x" * 32)
+        key = store(src, "videos/purge-me/purge.bin")
+        cached = pull_to_tmp(key)
+        self.assertTrue(cached.exists())
+
+        purge_tmp(key)
+        self.assertFalse(cached.exists())
+        self.assertFalse(cached.parent.exists())  # per-video dir tidied
+        self.assertTrue(self.tmp_root.exists())  # but never the cache root itself
+
+    def test_purge_is_safe_to_repeat_and_ignores_an_empty_key(self):
+        purge_tmp("")
+        purge_tmp("videos/never-existed/x.bin")  # must not raise
+
+    def test_sweep_removes_only_stale_entries(self):
+        src = Path(MEDIA) / "sweep.bin"
+        src.write_bytes(b"y" * 16)
+        fresh = pull_to_tmp(store(src, "videos/fresh/sweep.bin"))
+        stale = pull_to_tmp(store(src, "videos/stale/sweep.bin"))
+        old = time.time() - 60 * 60 * 24
+        os.utime(stale, (old, old))
+
+        self.assertEqual(sweep_tmp(max_age_hours=6), 1)
+        self.assertFalse(stale.exists())
+        self.assertTrue(fresh.exists())
+        purge_tmp("videos/fresh/sweep.bin")
 
 
 @override_settings(MEDIA_ROOT=MEDIA)

@@ -78,6 +78,41 @@ The image is `python:3.13-slim` while local development stays on 3.12 —
 - `DATABASE_URL`/`REDIS_URL` are overridden to `db:5432`/`redis:6379`; the values in
   `.env` are host ports and do not resolve inside the network.
 
+## Production
+
+```bash
+cp .env.prod.example .env.prod        # fill in SECRET_KEY, POSTGRES_PASSWORD, GEMINI_API_KEY, R2_*
+docker compose -f docker/prod/docker-compose.yaml --env-file .env.prod up -d --build
+docker compose -f docker/prod/docker-compose.yaml --env-file .env.prod exec web python manage.py migrate
+docker compose -f docker/prod/docker-compose.yaml --env-file .env.prod exec web python manage.py seed_ads
+docker compose -f docker/prod/docker-compose.yaml --env-file .env.prod exec web python manage.py createsuperuser
+```
+
+`--env-file` is not optional: compose reads `env_file:` only when passing variables *into*
+a container, never for `${VAR}` in the compose file itself. Without it `POSTGRES_PASSWORD`
+is empty, so the flag is enforced — compose refuses to start rather than silently building
+a blank-password database.
+
+web and worker share one image (`context-ai-backend:prod`, ~5.5GB, mostly torch) with the
+worker overriding the command. Model weights are baked in at `/opt/models`, so the first
+video after a deploy does not stall on a 230MB HuggingFace download. The worker runs
+`--concurrency=1` because `SCENE_ANALYSIS_RATE` is enforced per worker.
+
+Settings refuse to boot when they would be unsafe:
+
+```
+DEBUG=False and no SECRET_KEY   -> ImproperlyConfigured
+DEBUG=False and ALLOWED_HOSTS=* -> ImproperlyConfigured
+manage.py check --deploy        -> clean (security.W003 silenced, see settings.py)
+```
+
+**Storage matters here.** `STORAGE_BACKEND=local` only works because web and worker share
+a `media` volume, which limits you to one host. Use `r2` for anything else — the web
+container writes the upload and a worker on another machine has to read it back.
+
+TLS terminates upstream (Cloudflare Tunnel, Caddy, whatever): `SECURE_PROXY_SSL_HEADER`
+trusts `X-Forwarded-Proto`, so put it behind a proxy that sets it.
+
 ## The sample: Meridian
 
 [Meridian](http://download.opencontent.netflix.com/) is a 12-minute film-noir short that
@@ -261,7 +296,8 @@ Everything is env-driven via `django-environ`; see `.env.example`.
 | `TOP_K_ADS` / `IAB_BOOST` | `3` / `0.15` | ranking |
 | `EMBEDDING_MODEL` / `EMBEDDING_DIM` | MiniLM-L6-v2 / `384` | must agree, or migrations reject the vectors |
 | `EMBEDDING_DEVICE` | `cpu` | see below |
-| `STORAGE_BACKEND` | `local` | or `r2` |
+| `STORAGE_BACKEND` | `local` | or `r2`; `local` needs web and worker on one host |
+| `TMP_CACHE_HOURS` | `6` | age at which stranded video pulls get swept |
 
 ## Running on macOS
 

@@ -13,7 +13,7 @@ from . import gemini, media
 from .embeddings import embed
 from .matching import ad_text, rank_ads, scene_text
 from .models import Ad, Scene, Video
-from .storage import download, pull_to_tmp, store
+from .storage import download, pull_to_tmp, purge_tmp, store, sweep_tmp
 
 logger = logging.getLogger(__name__)
 
@@ -34,10 +34,12 @@ def _fetch_source(video: Video) -> str:
     else:
         local = download(video.source_url, tmp / (Path(video.source_url).name or "source.mp4"))
 
-    key = store(local, f"videos/{video.uuid}/{local.name}")
-    Video.objects.filter(pk=video.pk).update(file_key=key)
-    shutil.rmtree(tmp, ignore_errors=True)
-    return key
+    try:
+        key = store(local, f"videos/{video.uuid}/{local.name}")
+        Video.objects.filter(pk=video.pk).update(file_key=key)
+        return key
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def _youtube(url: str, into: Path) -> Path:
@@ -65,6 +67,7 @@ def process_video(video_id: int) -> str:
         Video.objects.filter(pk=video_id).update(
             status=Video.Status.PROCESSING, error="", scenes_total=0, scenes_done=0
         )
+        sweep_tmp()  # clear anything a previous failed run stranded
         video.file_key = _fetch_source(video)
         local = pull_to_tmp(video.file_key)
 
@@ -90,15 +93,17 @@ def detect_scenes(video_id: int) -> list[dict]:
     try:
         local = pull_to_tmp(video.file_key)
         tmp = Path(tempfile.mkdtemp(prefix="ctxai-frames-"))
-        scenes = []
-        for i, (start, end) in enumerate(media.detect_scenes(local)):
-            keys = []
-            for j, at in enumerate(media.keyframe_times(start, end)):
-                frame = media.extract_keyframe(local, at, tmp / f"{i:04d}_{j}.jpg")
-                keys.append(store(frame, f"videos/{video.uuid}/frames/{i:04d}_{j}.jpg"))
-            scenes.append({"start": start, "end": end, "keyframe_keys": keys})
-        shutil.rmtree(tmp, ignore_errors=True)
-        return scenes
+        try:
+            scenes = []
+            for i, (start, end) in enumerate(media.detect_scenes(local)):
+                keys = []
+                for j, at in enumerate(media.keyframe_times(start, end)):
+                    frame = media.extract_keyframe(local, at, tmp / f"{i:04d}_{j}.jpg")
+                    keys.append(store(frame, f"videos/{video.uuid}/frames/{i:04d}_{j}.jpg"))
+                scenes.append({"start": start, "end": end, "keyframe_keys": keys})
+            return scenes
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
     except Exception as exc:
         _fail(video_id, exc)
         raise
@@ -113,9 +118,10 @@ def transcribe_audio(video_id: int) -> list[dict]:
             return []
         local = pull_to_tmp(video.file_key)
         tmp = Path(tempfile.mkdtemp(prefix="ctxai-audio-"))
-        segments = media.transcribe(media.extract_audio(local, tmp / "audio.wav"))
-        shutil.rmtree(tmp, ignore_errors=True)
-        return segments
+        try:
+            return media.transcribe(media.extract_audio(local, tmp / "audio.wav"))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
     except Exception as exc:
         _fail(video_id, exc)
         raise
@@ -126,6 +132,9 @@ def build_scenes(results: list, video_id: int) -> str:
     """Steps 5-6: align transcript to cuts and persist. Phase 4 fans out analysis from here."""
     scenes, segments = results
     try:
+        # detect_scenes and transcribe_audio have both finished by now, so the cached
+        # copy of the video — up to hundreds of MB — is no longer needed
+        purge_tmp(Video.objects.values_list("file_key", flat=True).get(pk=video_id))
         texts = media.align([(s["start"], s["end"]) for s in scenes], segments)
         Scene.objects.filter(video_id=video_id).delete()  # idempotent on reprocess
         Scene.objects.bulk_create([

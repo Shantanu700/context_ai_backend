@@ -1,5 +1,3 @@
-// Mirrors certifier_reloaded_backend: the Python tooling is installed inside the
-// container, so go-to-definition works against the interpreter that holds the deps.
 {
 	"name": "Context-Aware Ad Recommender (Django 6, Python 3.13)",
 	"dockerComposeFile": [
@@ -18,7 +16,6 @@
 				"Anthropic.claude-code"
 			],
 			"settings": {
-				// deps live in the system prefix, not a .venv — see UV_PROJECT_ENVIRONMENT
 				"python.defaultInterpreterPath": "/usr/local/bin/python",
 				"terminal.integrated.profiles.linux": {
 					"zsh": {

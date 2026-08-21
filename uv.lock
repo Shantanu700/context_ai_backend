@@ -335,6 +335,7 @@ dependencies = [
     { name = "torch", version = "2.13.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'linux'" },
     { name = "torch", version = "2.13.0+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "sys_platform == 'linux'" },
     { name = "uuid6" },
+    { name = "whitenoise" },
 ]
 
 [package.metadata]
@@ -357,6 +358,7 @@ requires-dist = [
     { name = "torch", marker = "sys_platform != 'linux'", specifier = ">=2.13.0" },
     { name = "torch", marker = "sys_platform == 'linux'", specifier = ">=2.13.0", index = "https://download.pytorch.org/whl/cpu" },
     { name = "uuid6", specifier = ">=2025.0.1" },
+    { name = "whitenoise", specifier = ">=6.12.0" },
 ]
 
 [[package]]
@@ -1782,4 +1784,13 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/e8/dc/5cbfcb41824502f6af93b8f3943a4d06c67c23c7d2e31eb18748c4a5b2a7/websockets-16.1.1-cp313-cp313-win32.whl", hash = "sha256:cfb70b4eb56cac4da0a83588f3ad50d46beb0690391082f3d4e2d488c70b68ea", size = 179928, upload-time = "2026-07-17T22:50:01.685Z" },
     { url = "https://files.pythonhosted.org/packages/b0/c1/71e5deb5b7f8f226997ab64908c184ac3105c0155ce2d486f318e5dd08a8/websockets-16.1.1-cp313-cp313-win_amd64.whl", hash = "sha256:d9531d9cbeac99af6f038fb1bc351403531f7d634a2c2e10e2f7c854c6ed5b68", size = 180242, upload-time = "2026-07-17T22:50:03.117Z" },
     { url = "https://files.pythonhosted.org/packages/be/4d/2d0d67834092e354d2b0498f014a41249a89556bc406cf86f3e1557bb463/websockets-16.1.1-py3-none-any.whl", hash = "sha256:6abbd3e82c731c8e531714466acd5d87b5e88ac3243465337ba71d68e23ae7e3", size = 173814, upload-time = "2026-07-17T22:51:04.184Z" },
+]
+
+[[package]]
+name = "whitenoise"
+version = "6.12.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/cb/2a/55b3f3a4ec326cd077c1c3defeee656b9298372a69229134d930151acd01/whitenoise-6.12.0.tar.gz", hash = "sha256:f723ebb76a112e98816ff80fcea0a6c9b8ecde835f8ddda25df7a30a3c2db6ad", size = 26841, upload-time = "2026-02-27T00:05:42.028Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/db/eb/d5583a11486211f3ebd4b385545ae787f32363d453c19fffd81106c9c138/whitenoise-6.12.0-py3-none-any.whl", hash = "sha256:fc5e8c572e33ebf24795b47b6a7da8da3c00cff2349f5b04c02f28d0cc5a3cc2", size = 20302, upload-time = "2026-02-27T00:05:40.086Z" },
 ]

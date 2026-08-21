@@ -9,3 +9,4 @@ media/
 .samples/
 frames_preview/
 *.mp4
+.env.prod

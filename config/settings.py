@@ -2,6 +2,7 @@ import sys
 from pathlib import Path
 
 import environ
+from django.core.exceptions import ImproperlyConfigured
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
@@ -15,9 +16,18 @@ env = environ.Env(
 )
 environ.Env.read_env(BASE_DIR / ".env")
 
-SECRET_KEY = env("SECRET_KEY", default="dev-insecure-key-change-me")
 DEBUG = env("DEBUG")
+
+# the insecure fallback exists for local dev only — refuse to boot with it in production
+SECRET_KEY = env("SECRET_KEY", default="dev-insecure-key-change-me" if DEBUG else "")
+if not SECRET_KEY:
+    raise ImproperlyConfigured("SECRET_KEY must be set when DEBUG=False")
+
 ALLOWED_HOSTS = env("ALLOWED_HOSTS")
+if not DEBUG and ALLOWED_HOSTS == ["*"]:
+    raise ImproperlyConfigured("Set ALLOWED_HOSTS to real hostnames when DEBUG=False")
+
+CSRF_TRUSTED_ORIGINS = env.list("CSRF_TRUSTED_ORIGINS", default=[])
 
 INSTALLED_APPS = [
     "django.contrib.admin",
@@ -36,6 +46,8 @@ MIDDLEWARE = [
     "django.middleware.security.SecurityMiddleware",
     # must precede CommonMiddleware so preflights get their headers even on a redirect
     "corsheaders.middleware.CorsMiddleware",
+    # serves the admin's static files without a separate web server
+    "whitenoise.middleware.WhiteNoiseMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
     "django.middleware.common.CommonMiddleware",
     "config.middleware.DisableCSRFMiddleware",
@@ -91,6 +103,39 @@ STATIC_URL = "static/"
 STATIC_ROOT = BASE_DIR / "staticfiles"
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
+# uploads stream to a temp file instead of being buffered in memory
+DATA_UPLOAD_MAX_MEMORY_SIZE = env.int("DATA_UPLOAD_MAX_MEMORY_SIZE", default=5 * 1024 * 1024)
+FILE_UPLOAD_MAX_MEMORY_SIZE = DATA_UPLOAD_MAX_MEMORY_SIZE
+
+# --- production hardening (all no-ops while DEBUG=True) ---
+if not DEBUG:
+    # gunicorn sits behind a proxy/tunnel that terminates TLS
+    SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
+    SECURE_SSL_REDIRECT = env.bool("SECURE_SSL_REDIRECT", default=True)
+    SECURE_HSTS_SECONDS = env.int("SECURE_HSTS_SECONDS", default=31536000)
+    SECURE_HSTS_INCLUDE_SUBDOMAINS = True
+    SECURE_HSTS_PRELOAD = True
+    SESSION_COOKIE_SECURE = True
+    CSRF_COOKIE_SECURE = True
+    SECURE_CONTENT_TYPE_NOSNIFF = True
+    X_FRAME_OPTIONS = "DENY"
+
+# W003: CsrfViewMiddleware is intentionally absent — DisableCSRFMiddleware replaces it so a
+# cross-origin SPA can use the session cookie (the certifier_reloaded_backend pattern).
+# Residual risk, accepted knowingly: the session cookie is SameSite=None, and multipart or
+# form-encoded POSTs are "simple" requests that a third-party page can send without a
+# preflight. Close it by requiring a non-simple header on writes, or by restoring CSRF.
+SILENCED_SYSTEM_CHECKS = ["security.W003"]
+
+LOGGING = {
+    "version": 1,
+    "disable_existing_loggers": False,
+    "formatters": {"plain": {"format": "%(asctime)s %(levelname)s %(name)s %(message)s"}},
+    "handlers": {"console": {"class": "logging.StreamHandler", "formatter": "plain"}},
+    "root": {"handlers": ["console"], "level": env("LOG_LEVEL", default="INFO")},
+    "loggers": {"django.request": {"level": "ERROR", "handlers": ["console"], "propagate": False}},
+}
+
 REST_FRAMEWORK = {
     "DEFAULT_RENDERER_CLASSES": ["rest_framework.renderers.JSONRenderer"],
     "DEFAULT_AUTHENTICATION_CLASSES": ["core.permissions.SessionAuthentication"],
@@ -137,7 +182,7 @@ else:
 
 STORAGES = {
     "default": _default_storage,
-    "staticfiles": {"BACKEND": "django.contrib.staticfiles.storage.StaticFilesStorage"},
+    "staticfiles": {"BACKEND": "whitenoise.storage.CompressedManifestStaticFilesStorage"},
 }
 
 # --- celery ---
@@ -177,6 +222,8 @@ IAB_BOOST = env.float("IAB_BOOST", default=0.15)  # added per shared IAB categor
 
 # --- pipeline knobs (used from Phase 3 on) ---
 MAX_VIDEO_SECONDS = env("MAX_VIDEO_SECONDS")
+# cached video pulls older than this are swept at the start of each run
+TMP_CACHE_HOURS = env.float("TMP_CACHE_HOURS", default=6.0)
 WHISPER_MODEL = env("WHISPER_MODEL", default="base")
 # ContentDetector sensitivity: lower cuts more. Worth tuning per source — 4K HDR
 # grades and film grain both shift what counts as a cut.

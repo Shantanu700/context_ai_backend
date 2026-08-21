@@ -1,0 +1,19 @@
+# Build context hygiene: without this, COPY . . pulls in the local virtualenv, the
+# 851MB sample video and git history, which took the production image to 14GB.
+.git
+.venv
+.samples
+media
+staticfiles
+frames_preview
+*.mp4
+.env
+.env.prod
+__pycache__
+*.py[cod]
+.pytest_cache
+.ruff_cache
+.vscode
+.devcontainer
+docker
+README.md

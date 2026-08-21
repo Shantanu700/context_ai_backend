@@ -1,0 +1,69 @@
+
+# Production stack: web + worker share one image, with postgres and redis alongside.
+#   docker compose -f docker/prod/docker-compose.yaml --env-file .env.prod up -d --build
+x-app: &app
+  image: context-ai-backend:prod
+  build:
+    context: ../..
+    dockerfile: ./docker/prod/Dockerfile
+  env_file:
+    - path: ../../.env.prod
+      required: true
+  environment:
+    DATABASE_URL: postgres://postgres:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD, and pass --env-file .env.prod}@db:5432/context_ai
+    REDIS_URL: redis://redis:6379/0
+    DEBUG: "False"
+  volumes:
+    # web writes the upload, worker reads it — with STORAGE_BACKEND=local they must
+    # share a filesystem or the worker dies with FileNotFoundError. Unused (but
+    # harmless) when STORAGE_BACKEND=r2, which is what a multi-host deploy needs.
+    - media:/app/media
+  depends_on:
+    db:
+      condition: service_healthy
+    redis:
+      condition: service_started
+  restart: unless-stopped
+
+services:
+  web:
+    <<: *app
+    ports:
+      - "${WEB_PORT:-8000}:8000"
+
+  worker:
+    <<: *app
+    # concurrency 1 on purpose: SCENE_ANALYSIS_RATE is enforced per worker, so a second
+    # one doubles the request rate into Gemini and starts earning 429s
+    command: celery -A config worker -l info --concurrency=1
+    ports: []
+    healthcheck:
+      test: ["CMD", "celery", "-A", "config", "inspect", "ping", "-d", "celery@$$HOSTNAME"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+
+  db:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD, and pass --env-file .env.prod}
+      POSTGRES_DB: context_ai
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      retries: 10
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    volumes:
+      - redisdata:/data
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  redisdata:
+  media:
