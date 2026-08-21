@@ -106,9 +106,26 @@ DEBUG=False and ALLOWED_HOSTS=* -> ImproperlyConfigured
 manage.py check --deploy        -> clean (security.W003 silenced, see settings.py)
 ```
 
-**Storage matters here.** `STORAGE_BACKEND=local` only works because web and worker share
-a `media` volume, which limits you to one host. Use `r2` for anything else — the web
-container writes the upload and a worker on another machine has to read it back.
+**Storage.** Production runs `STORAGE_BACKEND=r2`: the web container writes the upload,
+the worker reads it back, and keyframes are handed to clients as presigned URLs, so the
+two never need a shared filesystem. `local` still works for a single-host deployment
+because web and worker share a `media` volume, but nothing beyond one host.
+
+Verify the storage config before trusting a deploy — this writes, reads, presigns,
+fetches anonymously over HTTPS and deletes a small object:
+
+```bash
+docker compose -f docker/prod/docker-compose.yaml --env-file .env.prod exec web \
+  python manage.py check_storage
+```
+
+The anonymous fetch is the point: that is exactly how the frontend loads keyframes, and
+it catches a wrong endpoint, a token scoped to the wrong bucket, or missing write
+permission for the cost of a 24-byte object rather than a 100MB upload.
+
+`R2_ENDPOINT_URL` is the **account** endpoint with no bucket path — django-storages
+appends the bucket, so pasting Cloudflare's full S3 API string verbatim yields
+`.../context-ai-bucket/context-ai-bucket/key` and every request 404s.
 
 TLS terminates upstream (Cloudflare Tunnel, Caddy, whatever): `SECURE_PROXY_SSL_HEADER`
 trusts `X-Forwarded-Proto`, so put it behind a proxy that sets it.
