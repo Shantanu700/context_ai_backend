@@ -162,8 +162,6 @@ class VideoViewSet(viewsets.GenericViewSet):
         ),
         responses={200: SceneSerializer(many=True), 404: OpenApiResponse(description="Unknown video")},
     )
-    # pagination_class=None: this action returns a bare array, and without it the
-    # generated schema advertises a paginated envelope the view never sends
     @action(detail=True, methods=["get"], pagination_class=None)
     def scenes(self, request, uuid=None):
         qs = self.get_object().scenes.select_related("recommended_ad")
