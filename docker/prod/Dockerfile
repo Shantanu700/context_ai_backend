@@ -22,14 +22,17 @@ ENV UV_PROJECT_ENVIRONMENT="/usr/local/" \
 WORKDIR /app
 
 COPY pyproject.toml uv.lock ./
-RUN UV_COMPILE_BYTECODE=1 uv sync --locked --no-install-project
+# --no-cache: with UV_LINK_MODE=copy the cache is a byte-for-byte duplicate of
+# site-packages, and it was shipping 1.4GB of dead weight inside the image
+RUN UV_COMPILE_BYTECODE=1 uv sync --locked --no-install-project --no-cache
 
 # Bake the model weights in. Downloading ~250MB from HuggingFace on first request would
 # make the first video of every deploy crawl, and rate-limit when several workers start.
 RUN python -c "\
 from sentence_transformers import SentenceTransformer; SentenceTransformer('${EMBEDDING_MODEL}', device='cpu');\
 from faster_whisper import WhisperModel; WhisperModel('${WHISPER_MODEL}', device='cpu', compute_type='int8')" \
-    && chmod -R a+rX /opt/models
+    && chmod -R a+rX /opt/models \
+    && rm -rf /root/.cache
 
 COPY . .
 
