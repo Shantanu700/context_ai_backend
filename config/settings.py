@@ -83,7 +83,7 @@ CORS_ALLOW_HEADERS = ["ngrok-skip-browser-warning", "content-type", "Authorizati
 # session cookie has to survive a cross-site XHR from the client origin
 SESSION_COOKIE_HTTPONLY = True
 SESSION_COOKIE_SAMESITE = "None"
-SESSION_COOKIE_SECURE = env.bool("SESSION_COOKIE_SECURE", default=True)
+SESSION_COOKIE_SECURE = True
 
 _LOCAL_DB = "postgres://postgres:postgres@localhost:5433/context_ai"
 DATABASES = {"default": env.db("DATABASE_URL", default=_LOCAL_DB)}
@@ -175,6 +175,7 @@ SPECTACULAR_SETTINGS = {
     "SERVE_INCLUDE_SCHEMA": False,  # the schema endpoint itself is not an API operation
     "SCHEMA_PATH_PREFIX": "",
     "ENUM_NAME_OVERRIDES": {"VideoStatusEnum": "core.models.Video.Status"},
+    "COMPONENT_SPLIT_REQUEST": True,
 }
 
 # --- storage: local filesystem by default, Cloudflare R2 when STORAGE_BACKEND=r2 ---

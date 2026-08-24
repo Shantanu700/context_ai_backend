@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
+from django.core.files.storage import default_storage
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import Client, TestCase, override_settings
 
@@ -16,7 +17,8 @@ from django.conf import settings
 
 from . import media
 from .matching import ad_text, rank_ads, scene_text
-from .models import Ad, Scene, Video
+from .models import Ad, AdSlot, Scene, Tone, Video
+from .slots import seed_slots
 from . import storage
 from .storage import pull_to_tmp, purge_tmp, store, sweep_tmp
 
@@ -29,7 +31,9 @@ class SmokeTests(TestCase):
 
     def test_models_persist(self):
         video = Video.objects.create(source_url="https://example.com/v.mp4", scenes_total=2)
-        ad = Ad.objects.create(brand="Acme", title="Rockets", description="fast", iab_categories=["IAB2"])
+        ad = Ad.objects.create(
+            brand="Acme", title="Rockets", description="fast", ad_type=Ad.AdType.VIDEO, iab_categories=["IAB2"],
+        )
         scene = Scene.objects.create(video=video, index=0, start=0.0, end=4.5, recommended_ad=ad)
 
         self.assertEqual(video.status, Video.Status.PENDING)
@@ -133,7 +137,10 @@ class ApiTests(TestCase):
     def test_ads_list_and_create(self):
         resp = self.client.post(
             "/ads",
-            {"brand": "Acme", "title": "Boots", "description": "fast", "iab_categories": ["IAB2"]},
+            {
+                "brand": "Acme", "title": "Boots", "description": "fast",
+                "ad_type": "video", "iab_categories": ["IAB2"],
+            },
             content_type="application/json",
         )
         self.assertEqual(resp.status_code, 201)
@@ -217,11 +224,21 @@ class SchemaTests(TestCase):
                 ("/login", "get"),
                 ("/login", "post"),
                 ("/login", "delete"),
+                ("/videos", "get"),
                 ("/videos", "post"),
+                ("/videos/{uuid}", "get"),
+                ("/videos/{uuid}", "delete"),
                 ("/videos/{uuid}/scenes", "get"),
+                ("/videos/{uuid}/slots", "get"),
+                ("/videos/{uuid}/slots", "put"),
                 ("/videos/{uuid}/status", "get"),
+                ("/videos/{uuid}/reprocess", "post"),
                 ("/ads", "get"),
                 ("/ads", "post"),
+                ("/ads/{id}", "get"),
+                ("/ads/{id}", "delete"),
+                ("/ads/{id}/asset", "put"),
+                ("/tones", "get"),
             },
         )
 
@@ -256,18 +273,18 @@ class MatchingTests(TestCase):
         self.scene = Scene.objects.create(
             video=self.video, index=0, start=0, end=5,
             description="a family drives along the coast",
-            tone="warm", iab_categories=["Automotive", "Travel"],
+            tone=Tone.objects.create(name="warm"), iab_categories=["Automotive", "Travel"],
             embedding=vec(1.0, 0.0),
         )
 
     def test_shared_iab_category_outranks_a_closer_vector(self):
         closer = Ad.objects.create(
-            brand="Closer", title="Exact vector match", description="x",
+            brand="Closer", title="Exact vector match", description="x", ad_type=Ad.AdType.VIDEO,
             iab_categories=["Pets"], embedding=vec(1.0, 0.0),
         )
         # cosine similarity 0.9, so it trails by 0.1 — less than one IAB_BOOST of 0.15
         boosted = Ad.objects.create(
-            brand="Boosted", title="Shares two categories", description="x",
+            brand="Boosted", title="Shares two categories", description="x", ad_type=Ad.AdType.VIDEO,
             iab_categories=["Automotive", "Travel"], embedding=vec(0.9, 0.43588989),
         )
 
@@ -279,18 +296,21 @@ class MatchingTests(TestCase):
 
     def test_iab_match_is_case_insensitive(self):
         Ad.objects.create(
-            brand="A", title="lowercased categories", description="x",
+            brand="A", title="lowercased categories", description="x", ad_type=Ad.AdType.VIDEO,
             iab_categories=["automotive"], embedding=vec(1.0, 0.0),
         )
         self.assertAlmostEqual(rank_ads(self.scene)[0][1], 1.0 + settings.IAB_BOOST, places=4)
 
     def test_ads_without_an_embedding_are_never_matched(self):
-        Ad.objects.create(brand="Unembedded", title="no vector", description="x")
+        Ad.objects.create(brand="Unembedded", title="no vector", description="x", ad_type=Ad.AdType.VIDEO)
         self.assertEqual(rank_ads(self.scene), [])
 
     def test_ranking_is_capped_at_top_k(self):
         for i in range(settings.TOP_K_ADS + 3):
-            Ad.objects.create(brand=f"B{i}", title=f"T{i}", description="x", embedding=vec(1.0, i / 100))
+            Ad.objects.create(
+                brand=f"B{i}", title=f"T{i}", description="x", ad_type=Ad.AdType.VIDEO,
+                embedding=vec(1.0, i / 100),
+            )
         self.assertEqual(len(rank_ads(self.scene)), settings.TOP_K_ADS)
 
     def test_embedded_text_carries_visuals_tone_and_speech(self):
@@ -302,8 +322,8 @@ class MatchingTests(TestCase):
 
     def test_ad_text_includes_brand_tone_and_categories(self):
         ad = Ad.objects.create(
-            brand="Northwind", title="Vega EV", description="An electric crossover.",
-            iab_categories=["Automotive"], target_tone="aspirational",
+            brand="Northwind", title="Vega EV", description="An electric crossover.", ad_type=Ad.AdType.VIDEO,
+            iab_categories=["Automotive"], target_tone=Tone.objects.create(name="aspirational"),
         )
         self.assertIn("Northwind", ad_text(ad))
         self.assertIn("aspirational", ad_text(ad))
@@ -318,8 +338,8 @@ class AnalyzeSceneTaskTests(TestCase):
         self.video = Video.objects.create(scenes_total=1, status=Video.Status.PROCESSING)
         self.scene = Scene.objects.create(video=self.video, index=0, start=0, end=5)
         self.ad = Ad.objects.create(
-            brand="Kettle & Co", title="Coffee", description="beans",
-            iab_categories=["Food & Drink"], target_tone="warm", embedding=vec(1.0),
+            brand="Kettle & Co", title="Coffee", description="beans", ad_type=Ad.AdType.VIDEO,
+            iab_categories=["Food & Drink"], target_tone=Tone.objects.create(name="warm"), embedding=vec(1.0),
         )
 
     def _run(self, analysis=None, fit=None, embed_side_effect=None):
@@ -346,7 +366,7 @@ class AnalyzeSceneTaskTests(TestCase):
         self.video.refresh_from_db()
 
         self.assertEqual(self.scene.description, "two friends share coffee")
-        self.assertEqual(self.scene.tone, "warm")
+        self.assertEqual(self.scene.tone.name, "warm")
         self.assertEqual(self.scene.iab_categories, ["Food & Drink"])
         self.assertEqual(self.scene.objects_seen, ["mug"])
         self.assertEqual(self.scene.recommended_ad, self.ad)
@@ -396,6 +416,148 @@ class AnalyzeSceneTaskTests(TestCase):
         self.assertEqual(body["scenes_failed"], 1)
 
 
+class StageFlagTaskTests(TestCase):
+    """detect_scenes/transcribe_audio/build_scenes/realign_scenes honor the per-video toggles."""
+
+    def test_detect_scenes_disabled_yields_one_full_span_scene(self):
+        from . import tasks
+
+        video = Video.objects.create(
+            file_key="videos/x/src.mp4", duration=12.0, detect_scenes_enabled=False
+        )
+        with (
+            patch.object(tasks, "pull_to_tmp", return_value=Path("/tmp/src.mp4")),
+            patch.object(tasks.media, "detect_scenes") as detect,
+            patch.object(tasks.media, "keyframe_times", return_value=[6.0]),
+            patch.object(tasks.media, "extract_keyframe", return_value=Path("/tmp/f.jpg")),
+            patch.object(tasks, "store", return_value="videos/x/frames/0000_0.jpg"),
+        ):
+            scenes = tasks.detect_scenes(video.pk)
+
+        detect.assert_not_called()
+        self.assertEqual(
+            scenes, [{"start": 0.0, "end": 12.0, "keyframe_keys": ["videos/x/frames/0000_0.jpg"]}]
+        )
+
+    def test_transcribe_audio_disabled_returns_empty_without_touching_media(self):
+        from . import tasks
+
+        video = Video.objects.create(file_key="videos/x/src.mp4", has_audio=True, transcribe_enabled=False)
+        with patch.object(tasks, "pull_to_tmp") as pull:
+            self.assertEqual(tasks.transcribe_audio(video.pk), [])
+        pull.assert_not_called()
+
+    def test_transcribe_audio_persists_raw_segments(self):
+        from . import tasks
+
+        video = Video.objects.create(file_key="videos/x/src.mp4", has_audio=True, transcribe_enabled=True)
+        segments = [{"start": 0.0, "end": 1.0, "text": "hi"}]
+        with (
+            patch.object(tasks, "pull_to_tmp", return_value=Path("/tmp/src.mp4")),
+            patch.object(tasks.media, "extract_audio", return_value=Path("/tmp/audio.wav")),
+            patch.object(tasks.media, "transcribe", return_value=segments),
+        ):
+            result = tasks.transcribe_audio(video.pk)
+
+        self.assertEqual(result, segments)
+        video.refresh_from_db()
+        self.assertEqual(video.transcript_segments, segments)
+
+    def test_build_scenes_skips_analysis_and_finishes_when_disabled(self):
+        from . import tasks
+
+        video = Video.objects.create(analyze_enabled=False, file_key="")
+        with patch.object(tasks, "purge_tmp"):
+            tasks.build_scenes(([{"start": 0.0, "end": 5.0, "keyframe_keys": []}], []), video.pk)
+
+        video.refresh_from_db()
+        self.assertEqual(video.status, Video.Status.DONE)
+        self.assertEqual(video.scenes.count(), 1)
+
+    def test_realign_scenes_updates_text_in_place_without_touching_analysis(self):
+        from . import tasks
+
+        video = Video.objects.create(analyze_enabled=False)
+        ad = Ad.objects.create(brand="A", title="T", description="d", ad_type=Ad.AdType.VIDEO, iab_categories=[])
+        scene = Scene.objects.create(
+            video=video, index=0, start=0.0, end=5.0,
+            keyframe_keys=["videos/x/frames/0000_0.jpg"],
+            description="already analyzed", recommended_ad=ad,
+        )
+
+        tasks.realign_scenes([{"start": 1.0, "end": 2.0, "text": "hello"}], video.pk)
+
+        scene.refresh_from_db()
+        video.refresh_from_db()
+        self.assertEqual(scene.transcript_text, "hello")
+        self.assertEqual(scene.description, "already analyzed")  # untouched
+        self.assertEqual(scene.recommended_ad, ad)  # untouched
+        self.assertEqual(scene.keyframe_keys, ["videos/x/frames/0000_0.jpg"])  # untouched
+        self.assertEqual(video.status, Video.Status.DONE)  # analyze disabled -> straight to done
+
+
+class ReprocessTests(TestCase):
+    def setUp(self):
+        self.client.force_login(get_user_model().objects.create_user("tester", password="pw"))
+
+    def test_requires_at_least_one_stage(self):
+        video = Video.objects.create()
+        resp = self.client.post(f"/videos/{video.uuid}/reprocess", {}, content_type="application/json")
+        self.assertEqual(resp.status_code, 400)
+
+    def test_rejects_transcribe_only_before_any_scenes_exist(self):
+        video = Video.objects.create()
+        resp = self.client.post(
+            f"/videos/{video.uuid}/reprocess", {"transcribe": True}, content_type="application/json"
+        )
+        self.assertEqual(resp.status_code, 400)
+
+    def test_rejects_while_already_processing(self):
+        video = Video.objects.create(status=Video.Status.PROCESSING)
+        resp = self.client.post(
+            f"/videos/{video.uuid}/reprocess", {"analyze": True}, content_type="application/json"
+        )
+        self.assertEqual(resp.status_code, 409)
+
+    def test_detect_scenes_requested_dispatches_full_rebuild(self):
+        video = Video.objects.create(status=Video.Status.DONE)
+        with patch("core.views.dispatch_detect_and_transcribe") as dispatch:
+            dispatch.return_value.id = "job-1"
+            resp = self.client.post(
+                f"/videos/{video.uuid}/reprocess",
+                {"detect_scenes": True, "transcribe": True},
+                content_type="application/json",
+            )
+        self.assertEqual(resp.status_code, 202)
+        dispatch.assert_called_once_with(video.pk, True)
+        video.refresh_from_db()
+        self.assertTrue(video.detect_scenes_enabled)
+        self.assertEqual(video.status, Video.Status.PROCESSING)
+
+    def test_transcribe_only_reuses_existing_scenes(self):
+        video = Video.objects.create(status=Video.Status.DONE)
+        Scene.objects.create(video=video, index=0, start=0, end=5)
+        with patch("core.views.dispatch_transcribe_only") as dispatch:
+            dispatch.return_value.id = "job-2"
+            resp = self.client.post(
+                f"/videos/{video.uuid}/reprocess", {"transcribe": True}, content_type="application/json"
+            )
+        self.assertEqual(resp.status_code, 202)
+        dispatch.assert_called_once_with(video.pk)
+
+    def test_analyze_only_requeues_existing_scenes(self):
+        video = Video.objects.create(status=Video.Status.DONE)
+        Scene.objects.create(video=video, index=0, start=0, end=5)
+        with patch("core.views.queue_analysis_or_finish") as dispatch:
+            dispatch.return_value.id = "job-3"
+            resp = self.client.post(
+                f"/videos/{video.uuid}/reprocess", {"analyze": True}, content_type="application/json"
+            )
+        self.assertEqual(resp.status_code, 202)
+        args, _ = dispatch.call_args
+        self.assertEqual(args[0], video.pk)
+
+
 class AdEmbeddingTests(TestCase):
     def setUp(self):
         self.client.force_login(get_user_model().objects.create_user("tester", password="pw"))
@@ -404,11 +566,248 @@ class AdEmbeddingTests(TestCase):
         with patch("core.views.embed_ad.delay") as delay:
             resp = self.client.post(
                 "/ads",
-                {"brand": "A", "title": "T", "description": "d", "iab_categories": ["Pets"]},
+                {"brand": "A", "title": "T", "description": "d", "ad_type": "video", "iab_categories": ["Pets"]},
                 content_type="application/json",
             )
         self.assertEqual(resp.status_code, 201)
         delay.assert_called_once_with(Ad.objects.get().pk)
+
+
+class AdAssetTests(TestCase):
+    def setUp(self):
+        self.client.force_login(get_user_model().objects.create_user("tester", password="pw"))
+
+    def test_creating_an_ad_with_a_file_stores_it_and_exposes_asset_url(self):
+        upload = SimpleUploadedFile("clip.mp4", b"\x00\x01", content_type="video/mp4")
+        with patch("core.views.embed_ad.delay"):
+            resp = self.client.post(
+                "/ads",
+                {"brand": "A", "title": "T", "description": "d", "ad_type": "video", "asset": upload},
+            )
+        self.assertEqual(resp.status_code, 201)
+        self.assertIsNotNone(resp.json()["asset_url"])
+        self.assertTrue(Ad.objects.get().asset_key)
+
+    def test_creating_an_ad_without_a_file_leaves_asset_url_null(self):
+        with patch("core.views.embed_ad.delay"):
+            resp = self.client.post(
+                "/ads",
+                {"brand": "A", "title": "T", "description": "d", "ad_type": "overlay"},
+                content_type="application/json",
+            )
+        self.assertIsNone(resp.json()["asset_url"])
+
+    def test_asset_action_replaces_the_stored_file(self):
+        ad = Ad.objects.create(brand="A", title="T", description="d", ad_type=Ad.AdType.OVERLAY)
+        first = SimpleUploadedFile("first.png", b"\x00", content_type="image/png")
+        second = SimpleUploadedFile("second.png", b"\x01", content_type="image/png")
+
+        self.client.put(f"/ads/{ad.pk}/asset", {"asset": first}, format="multipart")
+        ad.refresh_from_db()
+        first_key = ad.asset_key
+
+        resp = self.client.put(f"/ads/{ad.pk}/asset", {"asset": second}, format="multipart")
+        ad.refresh_from_db()
+        self.assertEqual(resp.status_code, 200)
+        self.assertNotEqual(ad.asset_key, first_key)
+        self.assertEqual(resp.json()["asset_url"], default_storage.url(ad.asset_key))
+
+    def test_deleting_an_ad_nulls_the_scenes_that_recommended_it(self):
+        video = Video.objects.create()
+        ad = Ad.objects.create(brand="A", title="T", description="d", ad_type=Ad.AdType.VIDEO)
+        scene = Scene.objects.create(video=video, index=0, start=0.0, end=1.0, recommended_ad=ad)
+
+        resp = self.client.delete(f"/ads/{ad.pk}")
+
+        self.assertEqual(resp.status_code, 204)
+        self.assertFalse(Ad.objects.filter(pk=ad.pk).exists())
+        scene.refresh_from_db()
+        self.assertIsNone(scene.recommended_ad)
+
+
+class SeedSlotsTests(TestCase):
+    """The first draft of the ad plan, derived from the analysis exactly once."""
+
+    def setUp(self):
+        self.video = Video.objects.create(duration=100.0)
+        self.ad = Ad.objects.create(
+            brand="Kettle & Co", title="Coffee", description="beans", ad_type=Ad.AdType.VIDEO,
+        )
+
+    def _scene(self, index, start, ad=None, score=None):
+        return Scene.objects.create(
+            video=self.video, index=index, start=start, end=start + 4,
+            recommended_ad=ad, match_score=score,
+        )
+
+    def test_placement_follows_position_in_the_video(self):
+        self._scene(0, 2.0, self.ad)    # inside the leading 5%
+        self._scene(1, 50.0, self.ad)
+        self._scene(2, 97.0, self.ad)   # inside the trailing 5%
+
+        self.assertEqual(seed_slots(self.video), 3)
+        self.assertEqual(
+            list(self.video.slots.order_by("at_seconds").values_list("placement", flat=True)),
+            [AdSlot.Placement.PRE, AdSlot.Placement.MID, AdSlot.Placement.POST],
+        )
+
+    def test_carries_the_scene_ad_and_score_across(self):
+        self._scene(0, 50.0, self.ad, score=0.88)
+
+        seed_slots(self.video)
+
+        slot = self.video.slots.get()
+        self.assertEqual(slot.ad, self.ad)
+        self.assertEqual(slot.scene.index, 0)
+        self.assertEqual(slot.at_seconds, 50.0)
+        self.assertEqual(slot.score, 0.88)
+        self.assertEqual(slot.state, AdSlot.State.SUGGESTED)
+        self.assertFalse(slot.is_overlay)
+
+    def test_an_overlay_ad_lands_in_the_overlay_lane(self):
+        overlay = Ad.objects.create(
+            brand="Volt", title="Bug", description="d", ad_type=Ad.AdType.OVERLAY,
+        )
+        self._scene(0, 50.0, overlay)
+
+        seed_slots(self.video)
+
+        self.assertTrue(self.video.slots.get().is_overlay)
+
+    def test_scenes_without_a_recommendation_are_skipped(self):
+        self._scene(0, 10.0, self.ad)
+        self._scene(1, 20.0, None)  # never analyzed, or nothing matched
+
+        self.assertEqual(seed_slots(self.video), 1)
+
+    def test_seeding_twice_does_not_undo_the_operators_edits(self):
+        self._scene(0, 10.0, self.ad)
+        self._scene(1, 20.0, self.ad)
+        seed_slots(self.video)
+        self.video.slots.filter(at_seconds=20.0).delete()  # operator rejected and removed it
+
+        self.assertEqual(seed_slots(self.video), 0)
+        self.assertEqual(self.video.slots.count(), 1)
+
+    def test_unknown_duration_falls_back_to_mid_roll(self):
+        self.video.duration = None
+        self.video.save(update_fields=["duration"])
+        self._scene(0, 0.0, self.ad)
+
+        seed_slots(self.video)
+
+        self.assertEqual(self.video.slots.get().placement, AdSlot.Placement.MID)
+
+
+class AdSlotApiTests(TestCase):
+    def setUp(self):
+        self.user = get_user_model().objects.create_user("tester", password="pw")
+        self.client.force_login(self.user)
+        self.video = Video.objects.create(user=self.user, duration=100.0, status=Video.Status.DONE)
+        self.ad = Ad.objects.create(
+            brand="Acme", title="Boots", description="d", ad_type=Ad.AdType.VIDEO,
+        )
+        self.scene = Scene.objects.create(
+            video=self.video, index=0, start=30.0, end=40.0, recommended_ad=self.ad, match_score=0.91,
+        )
+
+    def _put(self, body):
+        return self.client.put(
+            f"/videos/{self.video.uuid}/slots", body, content_type="application/json"
+        )
+
+    def test_get_seeds_the_plan_and_nests_the_ad(self):
+        body = self.client.get(f"/videos/{self.video.uuid}/slots").json()
+
+        self.assertEqual(len(body), 1)
+        self.assertEqual(body[0]["at_seconds"], 30.0)
+        self.assertEqual(body[0]["ad_detail"]["brand"], "Acme")
+        self.assertEqual(body[0]["score"], 0.91)
+
+    def test_get_is_a_bare_array_not_a_page(self):
+        self.assertIsInstance(self.client.get(f"/videos/{self.video.uuid}/slots").json(), list)
+
+    def test_put_replaces_the_whole_plan(self):
+        self.client.get(f"/videos/{self.video.uuid}/slots")  # seed first
+
+        resp = self._put([
+            {"at_seconds": 12.5, "duration": 6, "state": "accepted", "ad": self.ad.pk,
+             "placement": "mid_roll", "is_overlay": False},
+            {"at_seconds": 80.0, "duration": 30, "state": "held", "ad": None,
+             "placement": "post_roll", "is_overlay": True},
+        ])
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual([s["at_seconds"] for s in resp.json()], [12.5, 80.0])
+        self.assertEqual(self.video.slots.count(), 2)  # the seeded slot is gone
+
+    def test_put_with_an_empty_list_clears_the_plan(self):
+        self.client.get(f"/videos/{self.video.uuid}/slots")
+
+        self.assertEqual(self._put([]).json(), [])
+        self.assertEqual(self.video.slots.count(), 0)
+
+    def test_a_cleared_plan_is_not_re_seeded_on_the_next_read(self):
+        self.client.get(f"/videos/{self.video.uuid}/slots")
+        self._put([])
+
+        self.assertEqual(self.client.get(f"/videos/{self.video.uuid}/slots").json(), [])
+
+    def test_put_rejects_an_invalid_slot_without_touching_the_stored_plan(self):
+        self.client.get(f"/videos/{self.video.uuid}/slots")
+
+        resp = self._put([
+            {"at_seconds": 10.0, "duration": 15},
+            {"at_seconds": -3.0, "duration": 15},  # before the video starts
+        ])
+
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(self.video.slots.get().at_seconds, 30.0)  # the seeded plan survived
+
+    def test_put_rejects_a_zero_duration(self):
+        self.assertEqual(self._put([{"at_seconds": 1.0, "duration": 0}]).status_code, 400)
+
+    def test_a_slot_cannot_point_at_another_videos_scene(self):
+        other = Video.objects.create(user=self.user)
+        stranger = Scene.objects.create(video=other, index=0, start=0.0, end=1.0)
+
+        resp = self._put([{"at_seconds": 1.0, "duration": 15, "scene": stranger.pk}])
+
+        self.assertEqual(resp.status_code, 400)
+
+    def test_slots_are_scoped_to_the_owner(self):
+        self.client.force_login(get_user_model().objects.create_user("intruder", password="pw"))
+        self.assertEqual(self.client.get(f"/videos/{self.video.uuid}/slots").status_code, 404)
+
+    def test_retrieve_exposes_the_file_url_the_editor_plays(self):
+        self.video.file_key = "videos/x/src.mp4"
+        self.video.save(update_fields=["file_key"])
+
+        body = self.client.get(f"/videos/{self.video.uuid}").json()
+
+        self.assertEqual(body["uuid"], str(self.video.uuid))
+        self.assertIsNotNone(body["file_url"])
+
+    def test_deleting_the_video_takes_its_slots_with_it(self):
+        self.client.get(f"/videos/{self.video.uuid}/slots")
+
+        self.client.delete(f"/videos/{self.video.uuid}")
+
+        self.assertEqual(AdSlot.objects.count(), 0)
+
+
+class ToneListTests(TestCase):
+    def setUp(self):
+        self.client.force_login(get_user_model().objects.create_user("tester", password="pw"))
+
+    def test_lists_existing_tones_alphabetically_as_a_bare_array(self):
+        Tone.objects.create(name="warm")
+        Tone.objects.create(name="aspirational")
+
+        resp = self.client.get("/tones")
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual([t["name"] for t in resp.json()], ["aspirational", "warm"])
 
 
 class PreviewFramesTests(TestCase):
@@ -441,6 +840,7 @@ class AuthTests(TestCase):
             ("post", "/videos"),
             ("get", f"/videos/{self.video.uuid}/status"),
             ("get", f"/videos/{self.video.uuid}/scenes"),
+            ("post", f"/videos/{self.video.uuid}/reprocess"),
             ("get", "/ads"),
             ("post", "/ads"),
             ("get", "/login"),

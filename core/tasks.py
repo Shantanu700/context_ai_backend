@@ -12,7 +12,7 @@ from django.db.models import F
 from . import gemini, media
 from .embeddings import embed
 from .matching import ad_text, rank_ads, scene_text
-from .models import Ad, Scene, Video
+from .models import Ad, Scene, Tone, Video
 from .storage import download, pull_to_tmp, purge_tmp, store, sweep_tmp
 
 logger = logging.getLogger(__name__)
@@ -23,7 +23,6 @@ def _fail(video_id: int, exc: Exception) -> None:
 
 
 def _fetch_source(video: Video) -> str:
-    """Get the source into storage and return its key. Uploads already have one."""
     if video.file_key:
         return video.file_key
 
@@ -43,7 +42,6 @@ def _fetch_source(video: Video) -> str:
 
 
 def _youtube(url: str, into: Path) -> Path:
-    """Thin, best-effort adapter: shell out to yt-dlp if it happens to be installed."""
     if shutil.which("yt-dlp") is None:
         raise RuntimeError("yt-dlp is not installed — upload a file or run `manage.py fetch_sample` instead")
     try:
@@ -61,7 +59,6 @@ def _youtube(url: str, into: Path) -> Path:
 
 @shared_task
 def process_video(video_id: int) -> str:
-    """Steps 1-2 of the pipeline, then fan out scene detection and audio in parallel."""
     video = Video.objects.get(pk=video_id)
     try:
         Video.objects.filter(pk=video_id).update(
@@ -79,7 +76,15 @@ def process_video(video_id: int) -> str:
             )
         Video.objects.filter(pk=video_id).update(**info)
 
-        chord([detect_scenes.s(video_id), transcribe_audio.s(video_id)])(build_scenes.s(video_id))
+        tmp = Path(tempfile.mkdtemp(prefix="ctxai-thumb-"))
+        try:
+            thumb = media.extract_keyframe(local, min(1.0, info["duration"]), tmp / "thumbnail.jpg")
+            thumbnail_key = store(thumb, f"videos/{video.uuid}/thumbnail.jpg")
+            Video.objects.filter(pk=video_id).update(thumbnail_key=thumbnail_key)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+        dispatch_detect_and_transcribe(video_id, video.transcribe_enabled)
         return f"probed {video.uuid}: {info['duration']:.0f}s {info['width']}x{info['height']}"
     except Exception as exc:
         _fail(video_id, exc)
@@ -88,14 +93,14 @@ def process_video(video_id: int) -> str:
 
 @shared_task
 def detect_scenes(video_id: int) -> list[dict]:
-    """Steps 2-3: cut points, then keyframes uploaded to storage."""
     video = Video.objects.get(pk=video_id)
     try:
         local = pull_to_tmp(video.file_key)
         tmp = Path(tempfile.mkdtemp(prefix="ctxai-frames-"))
         try:
+            bounds = media.detect_scenes(local) if video.detect_scenes_enabled else [(0.0, video.duration)]
             scenes = []
-            for i, (start, end) in enumerate(media.detect_scenes(local)):
+            for i, (start, end) in enumerate(bounds):
                 keys = []
                 for j, at in enumerate(media.keyframe_times(start, end)):
                     frame = media.extract_keyframe(local, at, tmp / f"{i:04d}_{j}.jpg")
@@ -111,15 +116,16 @@ def detect_scenes(video_id: int) -> list[dict]:
 
 @shared_task
 def transcribe_audio(video_id: int) -> list[dict]:
-    """Step 4, in parallel with scene detection. No audio stream is not an error."""
     video = Video.objects.get(pk=video_id)
     try:
-        if not video.has_audio:
+        if not video.transcribe_enabled or not video.has_audio:
             return []
         local = pull_to_tmp(video.file_key)
         tmp = Path(tempfile.mkdtemp(prefix="ctxai-audio-"))
         try:
-            return media.transcribe(media.extract_audio(local, tmp / "audio.wav"))
+            segments = media.transcribe(media.extract_audio(local, tmp / "audio.wav"))
+            Video.objects.filter(pk=video_id).update(transcript_segments=segments)
+            return segments
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
     except Exception as exc:
@@ -127,13 +133,21 @@ def transcribe_audio(video_id: int) -> list[dict]:
         raise
 
 
+def queue_analysis_or_finish(video_id: int, scene_ids: list[int]):
+    if scene_ids and Video.objects.values_list("analyze_enabled", flat=True).get(pk=video_id):
+        Video.objects.filter(pk=video_id).update(scenes_done=0)
+        return chord(
+            group(analyze_scene.s(pk) for pk in scene_ids),
+            finish_video.s(video_id).on_error(fail_video.s(video_id=video_id)),
+        ).apply_async()
+    Video.objects.filter(pk=video_id).update(status=Video.Status.DONE)
+    return None
+
+
 @shared_task
 def build_scenes(results: list, video_id: int) -> str:
-    """Steps 5-6: align transcript to cuts and persist. Phase 4 fans out analysis from here."""
     scenes, segments = results
     try:
-        # detect_scenes and transcribe_audio have both finished by now, so the cached
-        # copy of the video — up to hundreds of MB — is no longer needed
         purge_tmp(Video.objects.values_list("file_key", flat=True).get(pk=video_id))
         texts = media.align([(s["start"], s["end"]) for s in scenes], segments)
         Scene.objects.filter(video_id=video_id).delete()  # idempotent on reprocess
@@ -153,18 +167,46 @@ def build_scenes(results: list, video_id: int) -> str:
         scene_ids = list(
             Scene.objects.filter(video_id=video_id).order_by("index").values_list("pk", flat=True)
         )
-        if scene_ids:
-            # the errback belongs on the chord body; celery rejects links on a group header
-            chord(
-                group(analyze_scene.s(pk) for pk in scene_ids),
-                finish_video.s(video_id).on_error(fail_video.s(video_id=video_id)),
-            ).apply_async()
-        else:
-            Video.objects.filter(pk=video_id).update(status=Video.Status.DONE)
+        queue_analysis_or_finish(video_id, scene_ids)
         return f"built {len(scenes)} scenes, {len(segments)} transcript segments"
     except Exception as exc:
         _fail(video_id, exc)
         raise
+
+
+@shared_task
+def realign_scenes(segments: list[dict], video_id: int) -> str:
+    """Re-align a fresh transcript onto EXISTING scenes, in place — unlike build_scenes,
+    this never touches keyframe_keys or any prior Gemini analysis on those rows."""
+    try:
+        scenes = list(Scene.objects.filter(video_id=video_id).order_by("index"))
+        texts = media.align([(s.start, s.end) for s in scenes], segments)
+        for scene, text in zip(scenes, texts):
+            scene.transcript_text = text
+        Scene.objects.bulk_update(scenes, ["transcript_text"])
+        queue_analysis_or_finish(video_id, [s.pk for s in scenes])
+        return f"realigned {len(scenes)} scenes, {len(segments)} transcript segments"
+    except Exception as exc:
+        _fail(video_id, exc)
+        raise
+
+
+@shared_task
+def frozen_transcript(video_id: int) -> list[dict]:
+    """Stand-in for transcribe_audio when a reprocess reuses the transcript from a prior
+    run instead of re-transcribing — same signature/shape, so build_scenes can't tell."""
+    return Video.objects.values_list("transcript_segments", flat=True).get(pk=video_id)
+
+
+def dispatch_detect_and_transcribe(video_id: int, transcribe_enabled: bool):
+    """Full scene rebuild: used both for the first run and a detect_scenes reprocess."""
+    transcribe_sig = transcribe_audio.s(video_id) if transcribe_enabled else frozen_transcript.s(video_id)
+    return chord([detect_scenes.s(video_id), transcribe_sig])(build_scenes.s(video_id))
+
+
+def dispatch_transcribe_only(video_id: int):
+    """Re-transcribe and re-align onto existing scenes without touching scene boundaries."""
+    return (transcribe_audio.s(video_id) | realign_scenes.s(video_id)).apply_async()
 
 
 TRANSIENT_STATUS = {429, 500, 502, 503, 504}  # rate limit / overloaded, worth re-queuing
@@ -172,12 +214,6 @@ TRANSIENT_STATUS = {429, 500, 502, 503, 504}  # rate limit / overloaded, worth r
 
 @shared_task(bind=True, rate_limit=settings.SCENE_ANALYSIS_RATE, max_retries=settings.SCENE_RETRIES)
 def analyze_scene(self, scene_id: int) -> int:
-    """Steps 7-9 for one scene: Gemini tags, embedding, ad match, rationale.
-
-    Rate-limited quota exhaustion is re-queued a minute later; anything else is logged
-    and the scene left untagged. Either way the chord must not be stranded, so a scene
-    only ever fails quietly — never by raising past the retry budget.
-    """
     scene = Scene.objects.get(pk=scene_id)
     try:
         frames = []
@@ -188,7 +224,9 @@ def analyze_scene(self, scene_id: int) -> int:
         analysis = gemini.analyze_scene(frames, scene.transcript_text)
         scene.description = analysis.description
         scene.objects_seen = analysis.objects
-        scene.tone = analysis.tone
+        if analysis.tone:
+            tone, _ = Tone.objects.get_or_create(name=analysis.tone.strip().lower())
+            scene.tone = tone
         scene.iab_categories = analysis.iab_categories
         scene.embedding = embed([scene_text(scene)])[0]
 
@@ -204,12 +242,9 @@ def analyze_scene(self, scene_id: int) -> int:
         scene.save()
     except Exception as exc:
         if getattr(exc, "code", None) in TRANSIENT_STATUS and self.request.retries < self.max_retries:
-            # raises Retry, so the increment below is skipped and the scene is not
-            # double-counted. A minute per attempt: the free-tier window is per minute.
             raise self.retry(exc=exc, countdown=60 * (self.request.retries + 1))
         logger.exception("scene %s analysis failed", scene_id)
 
-    # F() because these tasks land concurrently
     Video.objects.filter(pk=scene.video_id).update(scenes_done=F("scenes_done") + 1)
     return scene_id
 

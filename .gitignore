@@ -10,3 +10,5 @@ media/
 frames_preview/
 *.mp4
 .env.prod
+**/migrations/*.py
+!**/migrations/__init__.py

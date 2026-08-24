@@ -1,6 +1,4 @@
 
-# Production stack: web + worker share one image, with postgres and redis alongside.
-#   docker compose -f docker/prod/docker-compose.yaml --env-file .env.prod up -d --build
 x-app: &app
   image: context-ai-backend:prod
   build:
@@ -10,14 +8,9 @@ x-app: &app
     - path: ../../.env.prod
       required: true
   environment:
-    # DATABASE_URL comes from .env.prod: point it at Supabase (or any managed postgres),
-    # or at the bundled db service below by starting the `localdb` profile
     REDIS_URL: redis://redis:6379/0
     DEBUG: "False"
   volumes:
-    # web writes the upload, worker reads it — with STORAGE_BACKEND=local they must
-    # share a filesystem or the worker dies with FileNotFoundError. Unused (but
-    # harmless) when STORAGE_BACKEND=r2, which is what a multi-host deploy needs.
     - media:/app/media
   depends_on:
     redis:
@@ -32,8 +25,6 @@ services:
 
   worker:
     <<: *app
-    # concurrency 1 on purpose: SCENE_ANALYSIS_RATE is enforced per worker, so a second
-    # one doubles the request rate into Gemini and starts earning 429s
     command: celery -A config worker -l info --concurrency=1
     ports: []
     healthcheck:
@@ -42,8 +33,6 @@ services:
       timeout: 10s
       retries: 3
 
-  # Only started with `--profile localdb`. Managed postgres (Supabase) is the default;
-  # if you use this instead, set DATABASE_URL to postgres://postgres:...@db:5432/context_ai
   db:
     image: pgvector/pgvector:pg16
     profiles: ["localdb"]

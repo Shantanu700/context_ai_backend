@@ -1,6 +1,6 @@
 from django.contrib import admin
 
-from .models import Ad, Scene, Video
+from .models import Ad, Scene, Tone, Video
 
 
 class SceneInline(admin.TabularInline):
@@ -24,11 +24,18 @@ class VideoAdmin(admin.ModelAdmin):
         return f"{obj.scenes_done}/{obj.scenes_total}"
 
 
+@admin.register(Tone)
+class ToneAdmin(admin.ModelAdmin):
+    list_display = ("name", "created_at")
+    search_fields = ("name",)
+
+
 @admin.register(Ad)
 class AdAdmin(admin.ModelAdmin):
-    list_display = ("brand", "title", "target_tone", "has_embedding")
+    list_display = ("brand", "title", "ad_type", "target_tone", "has_embedding")
+    list_filter = ("ad_type",)
     search_fields = ("brand", "title", "description")
-    exclude = ("embedding",)
+    exclude = ("embedding", "asset_key")
 
     @admin.display(boolean=True, description="embedded")
     def has_embedding(self, obj):
