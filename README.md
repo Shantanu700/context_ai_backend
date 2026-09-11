@@ -288,27 +288,47 @@ silently drops it. CORS defaults to allow-all for development; set
 
 Views never touch ffmpeg or Gemini; everything below runs in a worker.
 
+```mermaid
+flowchart TD
+    post["POST /videos<br/>writes a row, queues a job, returns 202 + job_id"]
+    post --> probe
+
+    subgraph perception["perception — ffmpeg and CPU models"]
+        direction TB
+        probe["process_video<br/>pull to /tmp · ffprobe · reject over MAX_VIDEO_SECONDS"]
+        detect["detect_scenes<br/>ContentDetector cuts, then 1 keyframe for a scene under 5s,<br/>2 under 15s, else 3 — spaced off the cuts, downscaled to 768px"]
+        speech["transcribe_audio<br/>mono 16 kHz wav → faster-whisper segments<br/>skipped, not failed, when there is no audio stream"]
+        probe --> detect
+        probe --> speech
+    end
+
+    detect --> build
+    speech --> build
+    build["build_scenes<br/>align segments to cuts by midpoint · persist Scene rows"]
+
+    subgraph reasoning["reasoning — one rate-limited task per scene"]
+        direction TB
+        a0["analyze_scene 0"]
+        a1["analyze_scene 1"]
+        an["analyze_scene n"]
+    end
+
+    build --> a0
+    build --> a1
+    build --> an
+    a0 --> finish
+    a1 --> finish
+    an --> finish
+
+    finish["finish_video — chord callback<br/>prune to one scene per uniquely recommended ad,<br/>write each survivor's rationale + brand_safety_flag"]
+    finish --> done(["status = done"])
+    done -.-> plan["GET /videos/uuid/slots<br/>drafts the ad plan on first read"]
 ```
-process_video          pull to /tmp, ffprobe, reject over MAX_VIDEO_SECONDS
-   |
-   +-- detect_scenes     PySceneDetect ContentDetector -> cuts, then 1 keyframe for a
-   |                     scene under 5s, 2 under 15s, else 3, spaced off the cut points
-   |                     and downscaled to <=768px, uploaded to storage
-   +-- transcribe_audio  mono 16 kHz wav -> faster-whisper segments
-   |                     (skipped, not failed, when there is no audio stream)
-   |
-   v
-build_scenes           align segments to cuts by midpoint, persist Scene rows
-   |
-   +-- group of analyze_scene, one per scene, rate-limited
-   |     keyframes + transcript -> Gemini -> {description, objects, tone, iab_categories}
-   |     scene embedding -> pgvector cosine over the ad catalog, + IAB_BOOST per shared category
-   |     top-k stored on the scene; the best one becomes its recommended_ad
-   |
-   v
-finish_video           chord callback: prune to one scene per uniquely recommended ad,
-                       write each survivor's rationale + brand_safety_flag, mark done
-```
+
+Each `analyze_scene` does the same three things: keyframes and transcript to Gemini for
+`{description, objects, tone, iab_categories}`, then an embedding of that, then a pgvector
+lookup over the ad catalog boosted by shared IAB categories. Any task raising marks the
+video `failed` with the exception on the row.
 
 The rationale is written in `finish_video`, not in `analyze_scene`, because many scenes
 rank the same ad top. Pruning first — best-fit scene per unique ad, and scenes that matched
@@ -316,9 +336,25 @@ nothing are dropped along with their keyframes — spreads the plan across the t
 halves the Gemini spend, since the second call only runs on survivors. `GET /scenes` is
 therefore often shorter than `scenes_total`.
 
-`POST /reprocess` re-enters this graph partway: `detect_scenes` rebuilds everything,
-`transcribe` alone re-aligns a fresh transcript onto the existing scenes without touching
-their keyframes or prior analysis, and `analyze` alone re-queues the scenes as they stand.
+`POST /reprocess` re-enters this graph partway — which entry point depends on the stages
+asked for:
+
+```mermaid
+flowchart TD
+    req["POST /videos/uuid/reprocess<br/>detect_scenes · transcribe · analyze"] --> busy{"already<br/>processing?"}
+    busy -- yes --> c409(["409 — video is already processing"])
+    busy -- no --> any{"any stage<br/>requested?"}
+    any -- no --> c400(["400 — request at least one stage"])
+    any -- yes --> ready{"detect_scenes off<br/>and no scenes yet?"}
+    ready -- yes --> c400b(["400 — run detect_scenes at least once first"])
+    ready -- no --> which{"which stages?"}
+    which -- "detect_scenes" --> full["dispatch_detect_and_transcribe<br/>full rebuild: new cuts, new keyframes, new Scene rows"]
+    which -- "transcribe only" --> realign["dispatch_transcribe_only<br/>re-align a fresh transcript onto the existing scenes,<br/>leaving keyframes and prior analysis untouched"]
+    which -- "analyze only" --> requeue["queue_analysis_or_finish<br/>re-queue the scenes exactly as they stand"]
+    full --> acc(["202 + job_id"])
+    realign --> acc
+    requeue --> acc
+```
 
 `scenes_done` counts *attempts*, incremented with `F()` so concurrent tasks cannot lose
 one. A scene that hits a rate limit is re-queued; one that fails for any other reason is
@@ -333,6 +369,19 @@ uv run manage.py seed_ads --replace
 
 Each ad is embedded locally with sentence-transformers. Ads created through `POST /ads`
 are embedded by a worker task; an ad without an embedding is never matched.
+
+```mermaid
+flowchart LR
+    scene["scene<br/>description · objects<br/>tone · categories · speech"] --> se["MiniLM-L6-v2<br/>384-d, normalized"]
+    catalog["ad<br/>brand · title · copy<br/>tone · categories"] --> ae["same model,<br/>same space"]
+    ae --> store["pgvector column<br/>on every ad"]
+    se --> recall["cosine distance<br/>nearest AD_CANDIDATES = 50"]
+    store --> recall
+    recall --> rerank["re-rank in Python<br/>1 − distance + IAB_BOOST × shared categories"]
+    rerank --> topk["top_matches — TOP_K_ADS = 3"]
+    topk --> best["recommended_ad + match_score"]
+    best --> prune["finish_video: keep the best-fit<br/>scene per unique ad, then write its rationale"]
+```
 
 Gemini is restricted to a fixed IAB vocabulary (`core/gemini.py`). With free-form
 categories, scene and ad categories would essentially never coincide and `IAB_BOOST`
@@ -356,6 +405,21 @@ An overlay's position is stored as `{"x","y","w","h"}` fractions of the frame ra
 pixels, so a box dragged against a 720p preview still lands right at 4K. It is validated
 server-side — the values arrive straight from a drag in a browser, and a `JSONField` takes
 whatever it is handed.
+
+```mermaid
+stateDiagram-v2
+    [*] --> suggested: first GET /slots drafts one per recommended ad
+    suggested --> accepted: operator keeps the placement
+    suggested --> held: parked for a later pass
+    suggested --> rejected: not this ad, not here
+    held --> accepted
+    rejected --> suggested: PUT an earlier snapshot — undo
+    accepted --> [*]: part of the final plan
+```
+
+Those transitions are the editor's, not the server's: a `PUT` may set any state on any
+slot, and the API only checks that the slot itself is valid — positive duration, a
+non-negative timecode, a scene belonging to this video, an overlay box inside the frame.
 
 Ads carry a creative: `ad_type` is `video` or `overlay`, and `asset_key` points at the file
 the editor previews. `seed_ads` generates a placeholder clip or frame per ad with ffmpeg,
