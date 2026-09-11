@@ -153,6 +153,10 @@ class SceneSerializer(serializers.ModelSerializer):
         return [default_storage.url(key) for key in obj.keyframe_keys]
 
 
+#: Float slack for overlay-box bounds — see `validate_overlay_box`.
+EPSILON = 1e-6
+
+
 class AdSlotSerializer(serializers.ModelSerializer):
     """One ad placement. `ad` is written as a pk; `ad_detail` is what the editor renders."""
 
@@ -162,7 +166,7 @@ class AdSlotSerializer(serializers.ModelSerializer):
         model = AdSlot
         fields = (
             "id", "scene", "ad", "ad_detail", "at_seconds", "duration",
-            "placement", "is_overlay", "state", "score",
+            "placement", "is_overlay", "state", "score", "overlay_box",
         )
         # ids come and go as the operator adds and deletes slots, so a PUT assigns fresh
         # ones rather than trying to preserve them
@@ -177,6 +181,30 @@ class AdSlotSerializer(serializers.ModelSerializer):
         if value < 0:
             raise serializers.ValidationError("A slot cannot start before the video does.")
         return value
+
+    def validate_overlay_box(self, value):
+        """Fractions of the frame, so the four numbers have to describe a box inside it.
+
+        A JSONField takes whatever it is handed, and this one is written straight from a
+        drag in the browser — so it is checked here rather than trusted.
+        """
+        if value is None:
+            return value
+        if not isinstance(value, dict) or set(value) != {"x", "y", "w", "h"}:
+            raise serializers.ValidationError("An overlay box needs exactly x, y, w and h.")
+        # bool is an int subclass, and True would sail through the range check below
+        if any(isinstance(value[k], bool) or not isinstance(value[k], (int, float)) for k in value):
+            raise serializers.ValidationError("An overlay box's x, y, w and h must be numbers.")
+
+        x, y, w, h = (float(value[k]) for k in ("x", "y", "w", "h"))
+        if w <= 0 or h <= 0:
+            raise serializers.ValidationError("An overlay box must have a positive size.")
+        # A box flush against an edge arrives as 1.0000000000000002 often enough: these are
+        # binary floats that have been through JSON twice. The tolerance is far below one
+        # pixel of any real frame, so it costs nothing and saves rejecting a legitimate box.
+        if x < -EPSILON or y < -EPSILON or x + w > 1 + EPSILON or y + h > 1 + EPSILON:
+            raise serializers.ValidationError("An overlay box must sit inside the frame.")
+        return {"x": x, "y": y, "w": w, "h": h}
 
     def validate_scene(self, value):
         """A slot may only point at a scene of its own video."""

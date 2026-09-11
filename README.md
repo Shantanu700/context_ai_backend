@@ -2,16 +2,29 @@
 
 A JSON REST API that ingests a video, understands each scene (visuals, speech, emotional
 tone) and recommends which ad from a catalog to place at which timestamp — each with a
-one-line generated rationale and a brand-safety flag.
+one-line generated rationale and a brand-safety flag. It then drafts an ad plan that the
+client's timeline editor takes over.
 
-Backend only. No frontend; the Django admin is for inspecting data during development.
+The Next.js client is a separate origin and generates its types off `/schema`; the Django
+admin is for inspecting data during development.
 
 ```
 POST /videos ──► Celery ──► ffprobe ─► scene detection ─► keyframes ─┐
                                    └─► audio ─► whisper ────────────┤
                                                                      ▼
-                        Gemini tags ─► embed ─► pgvector match ─► rationale + safety flag
+        Gemini tags ─► embed ─► pgvector match ─► prune ─► rationale + safety flag
+                                                           │
+                                                           ▼
+                                 GET /videos/{uuid}/slots ─► the ad plan
 ```
+
+In the usual terms: shot-boundary detection sets the unit of analysis, a vision-language
+model tags each shot under a fixed IAB taxonomy with JSON-schema-constrained decoding, and
+a 384-d bi-encoder puts scenes and ads in one embedding space. Ranking is two-stage —
+pgvector ANN recall, then a hybrid re-rank fusing cosine similarity with taxonomy overlap.
+A second model call writes the rationale and the safety verdict, so a placement can be
+audited in one read rather than trusted as a score. Nothing auto-publishes: every slot
+starts as `suggested` and the operator's edits win from then on.
 
 ## Requirements
 
@@ -205,9 +218,16 @@ and `--end` take seconds or `HH:MM:SS` and let you sample a window of a long fil
 | POST | `/login` | `Authorization: Basic base64(user:pass)` -> session cookie — **public** |
 | GET, DELETE | `/login` | who am I / log out |
 | POST | `/videos` | multipart `file` **or** JSON `source_url`; returns `202 {uuid, job_id}` |
+| GET | `/videos` | the caller's videos, each with `file_url` |
+| GET, DELETE | `/videos/{uuid}` | one video (same shape plus `file_url`) / drop it and its scenes |
 | GET | `/videos/{uuid}/status` | `{status, scenes_done/scenes_total, scenes_failed, progress}` |
 | GET | `/videos/{uuid}/scenes` | scenes with tags, keyframe URLs, recommended ad, rationale, safety flag |
-| GET, POST | `/ads` | the catalog |
+| GET, PUT | `/videos/{uuid}/slots` | the ad plan — drafted on first read, then whole-list replace |
+| POST | `/videos/{uuid}/reprocess` | re-run `detect_scenes` / `transcribe` / `analyze`, opt-in per stage |
+| GET, POST | `/ads` | the catalog; `POST` may carry an `asset` file |
+| GET, DELETE | `/ads/{id}` | one ad / remove it from the catalog |
+| PUT | `/ads/{id}/asset` | replace the creative the editor previews |
+| GET | `/tones` | tones already in use, for tagging an ad's `target_tone` |
 | GET | `/schema` | OpenAPI 3.0.3 (YAML; `?format=json` for JSON) |
 | GET | `/docs`, `/redoc` | Swagger UI / Redoc — **`DEBUG=True` only**, they are HTML |
 
@@ -283,11 +303,22 @@ build_scenes           align segments to cuts by midpoint, persist Scene rows
    +-- group of analyze_scene, one per scene, rate-limited
    |     keyframes + transcript -> Gemini -> {description, objects, tone, iab_categories}
    |     scene embedding -> pgvector cosine over the ad catalog, + IAB_BOOST per shared category
-   |     top match -> Gemini one-line rationale + brand_safety_flag
+   |     top-k stored on the scene; the best one becomes its recommended_ad
    |
    v
-finish_video           chord callback marks the video done
+finish_video           chord callback: prune to one scene per uniquely recommended ad,
+                       write each survivor's rationale + brand_safety_flag, mark done
 ```
+
+The rationale is written in `finish_video`, not in `analyze_scene`, because many scenes
+rank the same ad top. Pruning first — best-fit scene per unique ad, and scenes that matched
+nothing are dropped along with their keyframes — spreads the plan across the timeline and
+halves the Gemini spend, since the second call only runs on survivors. `GET /scenes` is
+therefore often shorter than `scenes_total`.
+
+`POST /reprocess` re-enters this graph partway: `detect_scenes` rebuilds everything,
+`transcribe` alone re-aligns a fresh transcript onto the existing scenes without touching
+their keyframes or prior analysis, and `analyze` alone re-queues the scenes as they stand.
 
 `scenes_done` counts *attempts*, incremented with `F()` so concurrent tasks cannot lose
 one. A scene that hits a rate limit is re-queued; one that fails for any other reason is
@@ -307,6 +338,28 @@ Gemini is restricted to a fixed IAB vocabulary (`core/gemini.py`). With free-for
 categories, scene and ad categories would essentially never coincide and `IAB_BOOST`
 would be dead weight. Ranking is cosine similarity plus `IAB_BOOST` per shared category,
 so a slightly more distant ad in the right category beats a closer one in the wrong one.
+
+## The ad plan
+
+The pipeline recommends an ad per scene; the editor works in **slots**. `GET /videos/{uuid}/slots`
+bridges the two exactly once — one `suggested` slot per scene that has a recommended ad, at
+the scene's start, in the overlay lane if the ad is an overlay, and classed `pre_roll` /
+`mid_roll` / `post_roll` by where it falls (the outer 5% of the runtime counts as an edge).
+
+After that first read the slot list is the operator's document. `PUT` replaces the whole
+list, so one endpoint covers adding, moving, editing, removing and undo — a `PUT` of an
+earlier snapshot. An explicit plan, even an empty one, is never overwritten by a redraft;
+`slots_seeded` is what makes deletions stick, since a deleted slot leaves no row behind for
+an "are there slots?" check to notice.
+
+An overlay's position is stored as `{"x","y","w","h"}` fractions of the frame rather than
+pixels, so a box dragged against a 720p preview still lands right at 4K. It is validated
+server-side — the values arrive straight from a drag in a browser, and a `JSONField` takes
+whatever it is handed.
+
+Ads carry a creative: `ad_type` is `video` or `overlay`, and `asset_key` points at the file
+the editor previews. `seed_ads` generates a placeholder clip or frame per ad with ffmpeg,
+colored per brand, so the editor has something to render without real creative.
 
 ## Storage
 
@@ -337,6 +390,8 @@ Everything is env-driven via `django-environ`; see `.env.example`.
 | `GEMINI_MODEL` | `gemini-flash-lite-latest` | |
 | `SCENE_ANALYSIS_RATE` | `4/m` | scenes per minute |
 | `TOP_K_ADS` / `IAB_BOOST` | `3` / `0.15` | ranking |
+| `AD_CANDIDATES` | `50` | pulled by vector distance, then re-ranked in Python |
+| `GEMINI_RETRIES` / `SCENE_RETRIES` | `5` / `3` | SDK backoff attempts, then task re-queues |
 | `EMBEDDING_MODEL` / `EMBEDDING_DIM` | MiniLM-L6-v2 / `384` | must agree, or migrations reject the vectors |
 | `EMBEDDING_DEVICE` | `cpu` | see below |
 | `STORAGE_BACKEND` | `local` | or `r2`; `local` needs web and worker on one host |
@@ -360,7 +415,7 @@ OpenCV and PyAV each bundle their own `libavdevice`. It is noise, not a fault.
 uv run manage.py test
 ```
 
-33 tests. The ffmpeg ones build real clips and probe them; the Gemini ones are mocked, so
+84 tests. The ffmpeg ones build real clips and probe them; the Gemini ones are mocked, so
 the suite costs no quota and needs no API key.
 
 ## Layout
@@ -368,13 +423,16 @@ the suite costs no quota and needs no API key.
 ```
 config/        settings, celery app, root urls
 core/
-  models.py       Video, Scene, Ad
+  models.py       Video, Scene, Ad, Tone, AdSlot
   tasks.py        the Celery pipeline
   media.py        ffprobe / scenedetect / keyframes / whisper — pure functions, local paths
   gemini.py       scene analysis + rationale, and the IAB vocabulary
   embeddings.py   local sentence-transformers
-  matching.py     pgvector similarity + IAB boost
-  storage.py      store / pull_to_tmp / download
+  matching.py     pgvector similarity + IAB boost, and the per-ad dedupe
+  slots.py        recommendations -> the first draft of the ad plan
+  storage.py      store / pull_to_tmp / delete / download
+  serializers.py  DRF shapes, including the overlay-box validation
+  permissions.py  authenticated-by-default session auth
   views.py        DRF viewsets
-  management/commands/   seed_ads, fetch_sample, preview_frames
+  management/commands/   seed_ads, fetch_sample, preview_frames, check_storage
 ```

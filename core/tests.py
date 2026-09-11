@@ -16,7 +16,7 @@ from django.test import Client, TestCase, override_settings
 from django.conf import settings
 
 from . import media
-from .matching import ad_text, rank_ads, scene_text
+from .matching import ad_text, dedupe_by_ad, rank_ads, scene_text
 from .models import Ad, AdSlot, Scene, Tone, Video
 from .slots import seed_slots
 from . import storage
@@ -342,7 +342,7 @@ class AnalyzeSceneTaskTests(TestCase):
             iab_categories=["Food & Drink"], target_tone=Tone.objects.create(name="warm"), embedding=vec(1.0),
         )
 
-    def _run(self, analysis=None, fit=None, embed_side_effect=None):
+    def _run(self, analysis=None, embed_side_effect=None):
         from types import SimpleNamespace
 
         from . import tasks
@@ -351,10 +351,8 @@ class AnalyzeSceneTaskTests(TestCase):
             description="two friends share coffee", objects=["mug"], tone="warm",
             iab_categories=["Food & Drink"],
         )
-        fit = fit or SimpleNamespace(rationale="the ad matches the cosy mood", brand_safety_flag=False)
         with (
             patch.object(tasks.gemini, "analyze_scene", return_value=analysis) as ana,
-            patch.object(tasks.gemini, "write_rationale", return_value=fit),
             patch.object(tasks, "embed", side_effect=embed_side_effect or (lambda texts: [vec(1.0)])),
         ):
             tasks.analyze_scene(self.scene.pk)
@@ -370,17 +368,12 @@ class AnalyzeSceneTaskTests(TestCase):
         self.assertEqual(self.scene.iab_categories, ["Food & Drink"])
         self.assertEqual(self.scene.objects_seen, ["mug"])
         self.assertEqual(self.scene.recommended_ad, self.ad)
-        self.assertEqual(self.scene.rationale, "the ad matches the cosy mood")
+        # rationale/brand_safety_flag are deferred to _prune_scenes, after the whole
+        # video's chord finishes — analyze_scene alone never sets them
+        self.assertEqual(self.scene.rationale, "")
         self.assertFalse(self.scene.brand_safety_flag)
         self.assertEqual(self.scene.top_matches, [{"ad_id": self.ad.pk, "score": 1.15}])
         self.assertEqual(self.video.scenes_done, 1)
-
-    def test_persists_a_raised_brand_safety_flag(self):
-        from types import SimpleNamespace
-
-        self._run(fit=SimpleNamespace(rationale="upbeat ad against a grim scene", brand_safety_flag=True))
-        self.scene.refresh_from_db()
-        self.assertTrue(self.scene.brand_safety_flag)
 
     def test_a_failing_scene_still_counts_so_the_chord_completes(self):
         self._run(embed_side_effect=lambda texts: (_ for _ in ()).throw(RuntimeError("gemini exploded")))
@@ -414,6 +407,122 @@ class AnalyzeSceneTaskTests(TestCase):
         body = self.client.get(f"/videos/{self.video.uuid}/status").json()
         self.assertEqual(body["scenes_done"], 1)
         self.assertEqual(body["scenes_failed"], 1)
+
+
+class DedupeByAdTests(TestCase):
+    """matching.dedupe_by_ad: one winner per unique recommended ad."""
+
+    def setUp(self):
+        self.video = Video.objects.create()
+        self.ad_a = Ad.objects.create(brand="A", title="a", description="d", ad_type=Ad.AdType.VIDEO)
+        self.ad_b = Ad.objects.create(brand="B", title="b", description="d", ad_type=Ad.AdType.VIDEO)
+
+    def _scene(self, index, ad=None, score=None):
+        return Scene.objects.create(video=self.video, index=index, start=index, end=index + 1,
+                                     recommended_ad=ad, match_score=score)
+
+    def test_higher_score_wins_when_ads_match(self):
+        low = self._scene(0, self.ad_a, 0.5)
+        high = self._scene(1, self.ad_a, 0.9)
+
+        winners, losers = dedupe_by_ad([low, high])
+
+        self.assertEqual(winners, [high])
+        self.assertEqual(losers, [low])
+
+    def test_distinct_ads_both_survive(self):
+        one = self._scene(0, self.ad_a, 0.5)
+        two = self._scene(1, self.ad_b, 0.4)
+
+        winners, losers = dedupe_by_ad([one, two])
+
+        self.assertEqual(set(winners), {one, two})
+        self.assertEqual(losers, [])
+
+    def test_unmatched_scene_always_loses(self):
+        matched = self._scene(0, self.ad_a, 0.5)
+        unmatched = self._scene(1, None, None)
+
+        winners, losers = dedupe_by_ad([matched, unmatched])
+
+        self.assertEqual(winners, [matched])
+        self.assertEqual(losers, [unmatched])
+
+    def test_all_unmatched_means_no_winners(self):
+        a = self._scene(0, None, None)
+        b = self._scene(1, None, None)
+
+        winners, losers = dedupe_by_ad([a, b])
+
+        self.assertEqual(winners, [])
+        self.assertEqual(set(losers), {a, b})
+
+
+class PruneScenesTests(TestCase):
+    """tasks._prune_scenes: one rationale call per surviving winner, losers deleted."""
+
+    def setUp(self):
+        self.video = Video.objects.create()
+        self.ad = Ad.objects.create(brand="Kettle & Co", title="Coffee", description="beans",
+                                     ad_type=Ad.AdType.VIDEO)
+
+    def _scene(self, index, ad=None, score=None, keyframe_keys=()):
+        return Scene.objects.create(
+            video=self.video, index=index, start=index, end=index + 1,
+            recommended_ad=ad, match_score=score, keyframe_keys=list(keyframe_keys),
+        )
+
+    def test_keeps_best_scoring_scene_and_writes_its_rationale(self):
+        from types import SimpleNamespace
+
+        from . import tasks
+
+        weaker = self._scene(0, self.ad, 0.5, keyframe_keys=["videos/x/frames/0000_0.jpg"])
+        winner = self._scene(1, self.ad, 0.9, keyframe_keys=["videos/x/frames/0001_0.jpg"])
+        fit = SimpleNamespace(rationale="cosy morning fit", brand_safety_flag=True)
+
+        with (
+            patch.object(tasks.gemini, "write_rationale", return_value=fit) as write_rationale,
+            patch.object(tasks, "delete") as delete,
+        ):
+            kept = tasks._prune_scenes(self.video.pk)
+
+        self.assertEqual(kept, 1)
+        write_rationale.assert_called_once_with(winner, self.ad)
+        delete.assert_called_once_with("videos/x/frames/0000_0.jpg")
+
+        winner.refresh_from_db()
+        self.assertEqual(winner.rationale, "cosy morning fit")
+        self.assertTrue(winner.brand_safety_flag)
+        self.assertFalse(Scene.objects.filter(pk=weaker.pk).exists())
+        self.assertTrue(Scene.objects.filter(pk=winner.pk).exists())
+
+    def test_unmatched_scene_is_deleted_without_a_rationale_call(self):
+        from . import tasks
+
+        unmatched = self._scene(0, None, None)
+
+        with (
+            patch.object(tasks.gemini, "write_rationale") as write_rationale,
+            patch.object(tasks, "delete"),
+        ):
+            kept = tasks._prune_scenes(self.video.pk)
+
+        self.assertEqual(kept, 0)
+        write_rationale.assert_not_called()
+        self.assertFalse(Scene.objects.filter(pk=unmatched.pk).exists())
+
+    def test_all_unmatched_scenes_are_all_deleted(self):
+        from . import tasks
+
+        a = self._scene(0, None, None)
+        b = self._scene(1, None, None)
+
+        with patch.object(tasks, "delete"):
+            kept = tasks._prune_scenes(self.video.pk)
+
+        self.assertEqual(kept, 0)
+        self.assertEqual(Scene.objects.filter(pk__in=[a.pk, b.pk]).count(), 0)
 
 
 class StageFlagTaskTests(TestCase):

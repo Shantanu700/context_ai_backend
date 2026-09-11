@@ -23,6 +23,7 @@ dependencies = [
     "torch>=2.13.0",
     "uuid6>=2025.0.1",
     "whitenoise>=6.12.0",
+    "yt-dlp>=2026.8.19",
 ]
 
 # torch's linux wheels default to a CUDA build that drags in ~3.5GB of nvidia-* packages.

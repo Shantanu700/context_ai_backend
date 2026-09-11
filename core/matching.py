@@ -45,3 +45,24 @@ def rank_ads(scene) -> list[tuple[Ad, float]]:
 
     scored.sort(key=lambda pair: pair[1], reverse=True)
     return scored[: settings.TOP_K_ADS]
+
+
+def dedupe_by_ad(scenes) -> tuple[list, list]:
+    """Keep the best-scoring scene per unique recommended ad; everything else loses.
+
+    A scene with no recommended_ad (nothing matched, or analysis failed) always loses.
+    """
+    best = {}
+    losers = []
+    for scene in scenes:
+        if scene.recommended_ad_id is None:
+            losers.append(scene)
+            continue
+        current = best.get(scene.recommended_ad_id)
+        if current is None or scene.match_score > current.match_score:
+            if current is not None:
+                losers.append(current)
+            best[scene.recommended_ad_id] = scene
+        else:
+            losers.append(scene)
+    return list(best.values()), losers

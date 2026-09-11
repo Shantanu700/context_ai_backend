@@ -11,9 +11,9 @@ from django.db.models import F
 
 from . import gemini, media
 from .embeddings import embed
-from .matching import ad_text, rank_ads, scene_text
+from .matching import ad_text, dedupe_by_ad, rank_ads, scene_text
 from .models import Ad, Scene, Tone, Video
-from .storage import download, pull_to_tmp, purge_tmp, store, sweep_tmp
+from .storage import delete, download, pull_to_tmp, purge_tmp, store, sweep_tmp
 
 logger = logging.getLogger(__name__)
 
@@ -233,12 +233,7 @@ def analyze_scene(self, scene_id: int) -> int:
         matches = rank_ads(scene)
         scene.top_matches = [{"ad_id": ad.pk, "score": round(score, 4)} for ad, score in matches]
         if matches:
-            best, score = matches[0]
-            fit = gemini.write_rationale(scene, best)
-            scene.recommended_ad = best
-            scene.match_score = score
-            scene.rationale = fit.rationale
-            scene.brand_safety_flag = fit.brand_safety_flag
+            scene.recommended_ad, scene.match_score = matches[0]
         scene.save()
     except Exception as exc:
         if getattr(exc, "code", None) in TRANSIENT_STATUS and self.request.retries < self.max_retries:
@@ -249,10 +244,37 @@ def analyze_scene(self, scene_id: int) -> int:
     return scene_id
 
 
+def _prune_scenes(video_id: int) -> int:
+    """Many scenes often rank the same ad top; keep only the best-fit scene per unique
+    ad (and drop scenes that matched nothing), then write the rationale just for those
+    survivors instead of for every scene."""
+    scenes = list(Scene.objects.filter(video_id=video_id).order_by("index"))
+    winners, losers = dedupe_by_ad(scenes)
+
+    for scene in winners:
+        fit = gemini.write_rationale(scene, scene.recommended_ad)
+        scene.rationale = fit.rationale
+        scene.brand_safety_flag = fit.brand_safety_flag
+    if winners:
+        Scene.objects.bulk_update(winners, ["rationale", "brand_safety_flag"])
+
+    for scene in losers:
+        for key in scene.keyframe_keys:
+            delete(key)
+    Scene.objects.filter(pk__in=[s.pk for s in losers]).delete()
+
+    return len(winners)
+
+
 @shared_task
 def finish_video(scene_ids: list, video_id: int) -> str:
+    try:
+        kept = _prune_scenes(video_id)
+    except Exception as exc:
+        _fail(video_id, exc)
+        raise
     Video.objects.filter(pk=video_id).update(status=Video.Status.DONE)
-    return f"analyzed {len(scene_ids)} scenes"
+    return f"analyzed {len(scene_ids)} scenes, kept {kept}"
 
 
 @shared_task

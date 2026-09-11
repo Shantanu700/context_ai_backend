@@ -133,6 +133,12 @@ class AdSlot(models.Model):
     state = models.CharField(max_length=16, choices=State, default=State.SUGGESTED)
     score = models.FloatField(null=True, blank=True)
 
+    # Where an overlay sits on the frame: {"x","y","w","h"} as 0-1 fractions of the picture,
+    # so a placement made against a 720p preview still holds at 4K. Null on a video break,
+    # and on an overlay the operator has not positioned yet — the editor falls back to a
+    # default box for those rather than storing one nobody chose.
+    overlay_box = models.JSONField(null=True, blank=True)
+
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 

@@ -78,6 +78,12 @@ def sweep_tmp(max_age_hours: float | None = None) -> int:
     return removed
 
 
+def delete(key: str) -> None:
+    """Remove a stored object. Used when a losing scene's keyframes are pruned."""
+    if key:
+        default_storage.delete(key)
+
+
 def download(url: str, dest: Path) -> Path:
     """Fetch a direct media URL to disk. Not a YouTube adapter — that lands in Phase 3."""
     dest.parent.mkdir(parents=True, exist_ok=True)

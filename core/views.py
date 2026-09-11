@@ -256,7 +256,10 @@ class VideoViewSet(
         summary="Scenes with tags, keyframes and the recommended ad",
         description=(
             "Ordered by scene index. `description`, `tone`, `iab_categories` and the "
-            "recommendation are filled in by the per-scene analysis tasks."
+            "recommendation are filled in by the per-scene analysis tasks. Once analysis "
+            "finishes, scenes are pruned to at most one per uniquely recommended ad — "
+            "scenes that matched no ad, or lost to a better-fit scene for the same ad, "
+            "are deleted, so this list is often shorter than `scenes_total`."
         ),
         responses={200: SceneSerializer(many=True), 404: OpenApiResponse(description="Unknown video")},
     )
